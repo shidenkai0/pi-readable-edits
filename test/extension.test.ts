@@ -42,3 +42,26 @@ test("unrecognized command returns the normal result without an edits field", as
   assert.match(JSON.stringify(result.content), /plain/);
   assert.equal(result.details?.edits, undefined);
 });
+
+test("finite Python mapping and direct shell commands attach only changed text diffs", async () => {
+  const folder = `test/${work.split("/").pop()}`;
+  await writeFile(join(work, "a.md"), "before a\n");
+  await writeFile(join(work, "b.md"), "before b\n");
+  const python = `python3 - <<'PY'
+fixes = {'${folder}/a.md': 'after a\\n', '${folder}/b.md': 'after b\\n'}
+for path, content in fixes.items():
+    open(path, 'w').write(content)
+PY`;
+  const edited = await tool.execute("test-mapping", { command: python }, undefined, undefined, context() as any);
+  assert.deepEqual(edited.details.edits.map((entry: { path: string }) => entry.path), [
+    `${folder}/a.md`, `${folder}/b.md`,
+  ]);
+  assert.doesNotMatch(JSON.stringify(edited.content), /before a/);
+  await writeFile(join(work, "gone.md"), "remove me\n");
+  const moved = await tool.execute("test-file-ops", {
+    command: `cp ${folder}/a.md ${folder}/copy.md && rm ${folder}/gone.md`,
+  }, undefined, undefined, context() as any);
+  assert.deepEqual(moved.details.edits.map((entry: { path: string }) => entry.path), [
+    `${folder}/copy.md`, `${folder}/gone.md`,
+  ]);
+});

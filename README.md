@@ -19,11 +19,11 @@ For example, a Bash call like `python3 -c 'from pathlib import Path; Path("app.t
 
 ## What it recognizes
 
-- Bash file redirects (`>`, `>>`, and heredocs), `tee`, BSD/GNU `sed -i`, and `perl -pi`.
+- Bash file redirects (`>`, `>>`, and heredocs), `tee`, BSD/GNU `sed -i`, `perl -pi`, and direct `cp`, `mv`, `git mv`, or nonrecursive `rm` of named files.
 - Embedded `python -c` or heredoc source: `open(..., "w"/"a"/"x")`, `Path.write_text`/`write_bytes`, and a small set of direct file operations. Inline Node.js `writeFile`/`writeFileSync` is also recognized.
-- Literal paths, simple assignments, joins, finite lists, globs, and small local helpers. Paths are limited to the current Git worktree (or the Pi working directory outside Git).
+- Literal paths, simple assignments, joins, finite lists and dictionaries, globs, and small local helpers. Bash assignments, arrays, variable expansions, and finite `for` loops also resolve when their paths are static. Paths are limited to the current Git worktree (or the Pi working directory outside Git).
 
-Only changed, readable text files up to 256 KiB appear in the diff. Symlinks, external paths, binaries, and unresolved expressions retain the normal Bash display. Builds and tests are not analyzed for incidental output files. Diffs live in tool-result details for the UI, **not in model-facing output**. Large or unusual shell commands may have no diff.
+Only changed, readable text files up to 256 KiB appear in the diff. Symlinks, external paths, binaries, and unresolved expressions retain the normal Bash display. Builds and tests are not analyzed for incidental output files. Parsing and loop expansion are bounded; glob expansion requires a literal parent directory and skips directories with more than 4,096 entries. The extension does not execute code to infer paths. Diffs live in tool-result details for the UI, **not in model-facing output**. Large or unusual shell commands may have no diff.
 
 ## Develop and evaluate
 
@@ -45,8 +45,8 @@ For a complete private reference set, freeze a corpus (`pnpm corpus .local/luna-
 
 Corpus SHA-256 `0a4266587a5375d170dc4726101cc20ab34e8b71da943470aa1b291a4a1eeaa1`: 4,944 calls (Claude Code 1,154; Codex 3,790). Luna labeled 4,315 distinct command/working-directory pairs; duplicates expand to all 4,944 calls. After review of invalid paths and disagreements, labels classify 211 direct project-edit calls, 4,706 other calls, and 27 uncertain calls.
 
-Against that **model-labeled reference**, `task eval:full` reports **192/211 (91.00%) complete edit target sets**, **1/4,706 negative calls with a candidate target**, and **263/265 (99.25%) path precision / 263/370 (71.08%) path recall**. The 27 uncertain calls are excluded from accuracy denominators. Parser time was 0.31 s total (0.06 ms/call); filesystem snapshot and command execution are not included. The one negative candidate creates and removes temporary project files within the same command, so it would not produce a final UI diff.
+Against that **model-labeled reference**, `task eval:full` now reports **203/211 (96.21%) complete edit target sets**, **4/4,706 negative calls with a candidate target**, and **352/365 (96.44%) path precision / 352/370 (95.14%) path recall**. Before the finite-value and direct-file-command changes, the same reference gave 192/211 complete sets and 263/370 path recall. The 27 uncertain calls are excluded from accuracy denominators. Parser-only time is about 0.4 s for 4,944 calls (about 0.08 ms/call); filesystem snapshot and command execution are not included. Some disagreements reflect imperfect labels: the four negative candidates include direct file deletion, direct file creation, and a directory move; only changed text files can produce UI diffs.
 
-The separate curated hand set has 54/54 positive exact sets and 0/7 negative candidates, but is intentionally non-random and omits some copy targets. A 110-call deterministic stratified blind **same-model repeat** agreed on 107 labels after manual adjudication; that is a consistency check, not independent proof of ground-truth accuracy. Neither score establishes population-wide recall of edits Luna may have mislabeled as non-edits.
+The separate curated hand set has 54/54 positive exact sets and 0/7 negative candidates after correcting its omitted copy targets; it is intentionally non-random. A 110-call deterministic stratified blind **same-model repeat** agreed on 107 labels after manual adjudication; that is a consistency check, not independent proof of ground-truth accuracy. Neither score establishes population-wide recall of edits Luna may have mislabeled as non-edits.
 
 The current Pi TUI renders the diff on the Bash tool result. Other frontends must render the stored tool details themselves.

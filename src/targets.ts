@@ -1,13 +1,30 @@
+import { opendirSync, statSync } from "node:fs";
 import { access } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import fg from "fast-glob";
 import { Language, Parser, type Node as SyntaxNode } from "web-tree-sitter";
 
-type Value = string[];
+type Value =
+  | { kind: "text"; text: string }
+  | { kind: "sequence"; items: Value[] }
+  | { kind: "mapping"; entries: Array<[Value, Value]> }
+  | { kind: "unknown" };
 type Environment = Map<string, Value>;
 
 const MAX_COMMAND_BYTES = 512_000;
 const MAX_TARGETS = 128;
+const MAX_VISITS = 8192;
+const MAX_GLOB_ENTRIES = 4096;
+const UNKNOWN: Value = { kind: "unknown" };
+const text = (value: string): Value => ({ kind: "text", text: value });
+const sequence = (items: Value[]): Value | undefined =>
+  items.length <= MAX_TARGETS ? { kind: "sequence", items } : undefined;
+const strings = (value: Value | undefined): string[] | undefined =>
+  value?.kind === "text" ? [value.text] :
+  value?.kind === "sequence" && value.items.every((item) => item.kind === "text")
+    ? value.items.map((item) => (item as { kind: "text"; text: string }).text) : undefined;
+const scalar = (value: Value | undefined): string | undefined =>
+  value?.kind === "text" ? value.text : undefined;
 let parsers: Promise<{ bash: Parser; python: Parser; javascript: Parser }> | undefined;
 
 async function getParsers(): Promise<{ bash: Parser; python: Parser; javascript: Parser }> {
@@ -43,23 +60,65 @@ function literal(text: string): string | undefined {
   return body.replace(/\\(['\\])/g, "$1").replace(/\\n/g, "\n");
 }
 
-function shellWord(node: SyntaxNode): string | undefined {
-  if (node.type === "raw_string") return literal(node.text);
-  if (node.type === "string") {
-    // Bash double quotes preserve backslashes before most characters (unlike JSON).
-    const body = node.text.slice(1, -1);
-    if (/(^|[^\\])[$`]/.test(body)) return undefined;
-    return body.replace(/\\(["\\$`])/g, "$1").replace(/\\\n/g, "");
+function shellValue(node: SyntaxNode | null, env: Environment): Value | undefined {
+  if (!node) return undefined;
+  if (node.type === "command_name") return shellValue(node.namedChildren[0], env);
+  if (node.type === "raw_string") {
+    // Single-quoted shell words preserve backslashes verbatim, unlike Python.
+    return text(node.text.slice(1, -1));
   }
-  if (node.type !== "word" && node.type !== "command_name") return undefined;
-  if (node.namedChildren.length && node.type === "word") return undefined;
-  if (/[`${}\\]/.test(node.text)) return undefined;
-  return node.text;
+  if (node.type === "array") {
+    const items = node.namedChildren.map((child) => shellValue(child, env));
+    return items.every((item) => item !== undefined) ? sequence(items as Value[]) : undefined;
+  }
+  if (node.type === "simple_expansion" || node.type === "expansion") {
+    const variable = node.namedChildren[0];
+    if (variable?.type === "variable_name") return env.get(variable.text);
+    if (variable?.type === "subscript" && field(variable, "index")?.text === "@") {
+      return env.get(field(variable, "name")?.text ?? "");
+    }
+    return undefined;
+  }
+  if (node.type !== "word" && node.type !== "string") return undefined;
+  const start = node.type === "string" ? 1 : 0;
+  const end = node.type === "string" ? node.text.length - 1 : node.text.length;
+  let pieces = [""];
+  let offset = start;
+  for (const child of node.namedChildren) {
+    const before = node.text.slice(offset, child.startIndex - node.startIndex);
+    if (/[`$]/.test(before)) return undefined;
+    pieces = pieces.map((part) => part + before);
+    const value = child.type === "string_content" ? text(child.text) : shellValue(child, env);
+    const parts = strings(value);
+    if (!parts || pieces.length * parts.length > MAX_TARGETS) return undefined;
+    // Bash "${array[@]}suffix" does not append the suffix to each element.
+    if (parts.length > 1 && (pieces.some((part) => part !== "") || child.endIndex - node.startIndex !== end)) return undefined;
+    pieces = pieces.flatMap((part) => parts.map((item) => part + item));
+    offset = child.endIndex - node.startIndex;
+  }
+  const tail = node.text.slice(offset, end);
+  if (/[`$]/.test(tail)) return undefined;
+  pieces = pieces.map((part) => (part + tail).replace(/\\(["\\$`])/g, "$1").replace(/\\\n/g, ""));
+  return pieces.length === 1 ? text(pieces[0]) : sequence(pieces.map(text));
 }
 
-function expand(pattern: string, cwd: string): Value {
+function expand(pattern: string, cwd: string): string[] {
   if (!/[*?[\]]/.test(pattern)) return [pattern];
   if (isAbsolute(pattern)) return [];
+  const directory = dirname(pattern);
+  // A literal parent keeps glob work finite. Recursive or wildcard-directory
+  // scans are intentionally left to ordinary Bash output.
+  if (/[*?[\]{}]/.test(directory)) return [];
+  let entries;
+  try {
+    entries = opendirSync(resolve(cwd, directory));
+    let count = 0;
+    while (entries.readSync()) if (++count > MAX_GLOB_ENTRIES) return [];
+  } catch {
+    return [];
+  } finally {
+    try { entries?.closeSync(); } catch { /* already closed at EOF */ }
+  }
   return fg.sync(pattern, {
     cwd, dot: true, onlyFiles: true, followSymbolicLinks: false,
     ignore: ["**/.git/**", "**/node_modules/**", "**/.local/**"],
@@ -70,64 +129,90 @@ function argsOf(node: SyntaxNode): SyntaxNode[] {
   return node.namedChildren.filter((child) => child.type !== "command_name");
 }
 
-function sequenceExpression(node: SyntaxNode | null): boolean {
-  if (!node) return false;
-  if (node.type === "list" || node.type === "tuple") return true;
-  if (node.type === "call") return /^(?:glob\.glob|glob\.iglob)$/.test(field(node, "function")?.text ?? "");
-  if (node.type === "binary_operator" && node.children.some((child) => child.type === "+")) {
-    return sequenceExpression(field(node, "left")) || sequenceExpression(field(node, "right"));
-  }
-  return false;
-}
-
-function evalPython(node: SyntaxNode | null, env: Environment, cwd: string): Value | undefined {
-  if (!node) return undefined;
+function evalPython(node: SyntaxNode | null, env: Environment, cwd: string, depth = 0): Value | undefined {
+  if (!node || depth > 16) return undefined;
+  const evaluate = (child: SyntaxNode | null) => evalPython(child, env, cwd, depth + 1);
   if (node.type === "string") {
     if (node.namedChildren.some((child) => child.type === "interpolation")) {
       let result = "";
       for (const child of node.namedChildren) {
         if (child.type === "string_content") result += child.text;
         else if (child.type === "interpolation") {
-          const part = evalPython(field(child, "expression"), env, cwd);
-          if (part?.length !== 1) return undefined;
-          result += part[0];
+          const part = scalar(evaluate(field(child, "expression")));
+          if (part === undefined) return undefined;
+          result += part;
         }
       }
-      return [result];
+      return text(result);
     }
     const value = literal(node.text);
-    return value === undefined ? undefined : [value];
+    return value === undefined ? undefined : text(value);
   }
   if (node.type === "identifier") return env.get(node.text);
-  if (node.type === "parenthesized_expression") return evalPython(node.namedChildren[0], env, cwd);
+  if (node.type === "parenthesized_expression") return evaluate(node.namedChildren[0]);
   if (node.type === "list" || node.type === "tuple") {
-    const items = node.namedChildren.map((item) => evalPython(item, env, cwd));
-    return items.every((item) => item && item.length === 1) ? items.flatMap((item) => item!) : undefined;
+    if (node.namedChildren.length > MAX_TARGETS) return undefined;
+    return sequence(node.namedChildren.map((item) => evaluate(item) ?? UNKNOWN));
+  }
+  if (node.type === "dictionary") {
+    if (node.namedChildren.length > MAX_TARGETS) return undefined;
+    const entries: Array<[Value, Value]> = [];
+    for (const pair of node.namedChildren) {
+      if (pair.type !== "pair") return undefined;
+      const key = evaluate(field(pair, "key"));
+      if (!key || key.kind !== "text") return undefined;
+      entries.push([key, evaluate(field(pair, "value")) ?? UNKNOWN]);
+    }
+    return { kind: "mapping", entries };
   }
   if (node.type === "binary_operator") {
-    const left = evalPython(field(node, "left"), env, cwd);
-    const right = evalPython(field(node, "right"), env, cwd);
+    const left = evaluate(field(node, "left"));
+    const right = evaluate(field(node, "right"));
     const operator = node.children.find((child) => child.type === "/" || child.type === "+")?.type;
     if (!left || !right) return undefined;
-    if (operator === "+" && (sequenceExpression(field(node, "left")) || sequenceExpression(field(node, "right")))) {
-      return [...left, ...right].slice(0, MAX_TARGETS);
+    if (operator === "+" && left.kind === "sequence" && right.kind === "sequence") {
+      return sequence([...left.items, ...right.items]);
     }
-    if (!operator || left.length * right.length > MAX_TARGETS) return undefined;
-    return left.flatMap((a) => right.map((b) => operator === "/" ? `${a.replace(/\/$/, "")}/${b}` : a + b));
+    const a = scalar(left), b = scalar(right);
+    return operator && a !== undefined && b !== undefined
+      ? text(operator === "/" ? (isAbsolute(b) ? b : `${a.replace(/\/$/, "")}/${b}`) : a + b) : undefined;
   }
   if (node.type === "call") {
     const fn = field(node, "function")?.text;
     const params = field(node, "arguments")?.namedChildren ?? [];
-    if (fn === "Path" || fn === "pathlib.Path" || fn === "str") return evalPython(params[0], env, cwd);
+    if (fn === "Path" || fn === "pathlib.Path" || fn === "str") return evaluate(params[0]);
     if (fn === "glob.glob" || fn === "glob.iglob") {
-      const pattern = evalPython(params[0], env, cwd);
-      return pattern?.length === 1 ? expand(pattern[0], cwd) : undefined;
+      const pattern = scalar(evaluate(params[0]));
+      return pattern === undefined ? undefined : sequence(expand(pattern, cwd).map(text));
     }
     if (fn?.endsWith(".resolve") || fn?.endsWith(".absolute")) {
-      return evalPython(field(field(node, "function")!, "object"), env, cwd);
+      return evaluate(field(field(node, "function")!, "object"));
+    }
+    const functionNode = field(node, "function");
+    const receiver = functionNode && field(functionNode, "object");
+    const method = functionNode && field(functionNode, "attribute")?.text;
+    const mapping = evaluate(receiver);
+    if (mapping?.kind === "mapping" && params.length === 0) {
+      if (method === "keys") return sequence(mapping.entries.map(([key]) => key));
+      if (method === "values") return sequence(mapping.entries.map(([, value]) => value));
+      if (method === "items") return sequence(mapping.entries.map(([key, value]) =>
+        ({ kind: "sequence", items: [key, value] })));
     }
   }
   return undefined;
+}
+
+/** Preserve tuple/key-value correspondence instead of taking Cartesian products of names. */
+function bind(pattern: SyntaxNode, value: Value, env: Environment): boolean {
+  if (pattern.type === "identifier") {
+    env.set(pattern.text, value);
+    return true;
+  }
+  if ((pattern.type === "pattern_list" || pattern.type === "tuple_pattern") && value.kind === "sequence" &&
+      pattern.namedChildren.length === value.items.length) {
+    return pattern.namedChildren.every((child, index) => bind(child, value.items[index], env));
+  }
+  return false;
 }
 
 function inspectPython(source: string, cwd: string, add: (path: string, cwd: string) => void, parser: Parser): void {
@@ -135,11 +220,16 @@ function inspectPython(source: string, cwd: string, add: (path: string, cwd: str
   if (!root || root.hasError) return;
   const env: Environment = new Map();
   const helpers = new Map<string, SyntaxNode>();
+  let visits = 0;
   function visit(node: SyntaxNode, values: Environment, depth = 0): void {
-    if (depth > 8) return;
+    if (depth > 8 || ++visits > MAX_VISITS) return;
     if (node.type === "function_definition") {
       const name = field(node, "name")?.text;
       if (name) helpers.set(name, node);
+      return;
+    }
+    if (node.type === "if_statement") {
+      for (const child of node.namedChildren) visit(child, new Map(values), depth + 1);
       return;
     }
     if (node.type === "assignment") {
@@ -158,21 +248,16 @@ function inspectPython(source: string, cwd: string, add: (path: string, cwd: str
       const iterable = field(node, "right");
       const options = evalPython(iterable, values, cwd);
       const body = field(node, "body");
-      if (name?.type === "identifier" && options && options.length <= MAX_TARGETS && body) {
-        for (const option of options) {
+      if (options?.kind === "sequence" && body) {
+        for (const option of options.items) {
           const scoped = new Map(values);
-          scoped.set(name.text, [option]);
+          if (!name || !bind(name, option, scoped)) continue;
           visit(body, scoped, depth);
         }
-      } else if (name?.type === "pattern_list" && iterable?.type === "list" && body) {
-        const names = name.namedChildren.filter((child) => child.type === "identifier");
-        for (const tuple of iterable.namedChildren.slice(0, MAX_TARGETS)) {
-          if (tuple.type !== "tuple" || tuple.namedChildren.length !== names.length) continue;
+      } else if (options?.kind === "mapping" && name?.type === "identifier" && body) {
+        for (const [key] of options.entries) {
           const scoped = new Map(values);
-          tuple.namedChildren.forEach((item, index) => {
-            const value = evalPython(item, values, cwd);
-            if (value) scoped.set(names[index].text, value);
-          });
+          scoped.set(name.text, key);
           visit(body, scoped, depth);
         }
       }
@@ -193,20 +278,20 @@ function inspectPython(source: string, cwd: string, add: (path: string, cwd: str
         const body = field(helper, "body");
         if (body) visit(body, scoped, depth + 1);
       }
-      let paths: Value | undefined;
-      if ((name === "open" || name === "io.open") && /[wax+]/.test(evalPython(params[1], values, cwd)?.[0] ?? "")) {
-        paths = evalPython(params[0], values, cwd);
+      let paths: string[] | undefined;
+      if ((name === "open" || name === "io.open") && /[wax+]/.test(scalar(evalPython(params[1], values, cwd)) ?? "")) {
+        paths = strings(evalPython(params[0], values, cwd));
       } else if (fn?.type === "attribute") {
         const method = field(fn, "attribute")?.text;
         const receiver = field(fn, "object");
         if (method === "write_text" || method === "write_bytes" || method === "touch" || method === "unlink" || method === "mkdir") {
-          paths = evalPython(receiver, values, cwd);
-        } else if (method === "open" && /[wax+]/.test(evalPython(params[0], values, cwd)?.[0] ?? "")) {
-          paths = evalPython(receiver, values, cwd);
+          paths = strings(evalPython(receiver, values, cwd));
+        } else if (method === "open" && /[wax+]/.test(scalar(evalPython(params[0], values, cwd)) ?? "")) {
+          paths = strings(evalPython(receiver, values, cwd));
         }
       }
       if (name && /^(?:os\.rename|os\.replace|shutil\.(?:copy|copy2|copyfile|move))$/.test(name)) {
-        paths = [...(evalPython(params[0], values, cwd) ?? []), ...(evalPython(params[1], values, cwd) ?? [])];
+        paths = [...(strings(evalPython(params[0], values, cwd)) ?? []), ...(strings(evalPython(params[1], values, cwd)) ?? [])];
       }
       paths?.forEach((path) => add(path, cwd));
     }
@@ -290,22 +375,71 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
     found.add(absolute);
   }
 
-  function visit(node: SyntaxNode, initialCwd: string, heredoc?: string): string {
+  let visits = 0;
+  function visit(node: SyntaxNode, initialCwd: string, env: Environment, heredoc?: string,
+    depth = 0, createdDirectories = new Set<string>()): string {
+    if (depth > 8 || ++visits > MAX_VISITS) return initialCwd;
     let cwd = initialCwd;
+    if (node.type === "variable_assignment") {
+      const name = field(node, "name")?.text;
+      if (name) {
+        const value = shellValue(field(node, "value"), env);
+        if (value) env.set(name, value);
+        else env.delete(name);
+      }
+      return cwd;
+    }
+    if (node.type === "for_statement") {
+      const variable = field(node, "variable")?.text;
+      const body = field(node, "body");
+      const values = node.children.filter((child) => child.type === "word" || child.type === "string" || child.type === "raw_string")
+        .map((child) => {
+          const options = strings(shellValue(child, env));
+          return child.type === "word" ? options?.flatMap((option) => expand(option, cwd)) : options;
+        });
+      if (variable && body && values.every((value) => value !== undefined)) {
+        const options = values.flat() as string[];
+        if (options.length <= MAX_TARGETS) {
+          for (const option of options) {
+            env.set(variable, text(option));
+            cwd = visit(body, cwd, env, heredoc, depth + 1, createdDirectories);
+          }
+          return cwd;
+        }
+      }
+      if (variable) env.delete(variable);
+      return initialCwd;
+    }
+    if (node.type === "if_statement" || node.type === "case_statement") {
+      // The condition is not evaluated; inspect each possible branch, but never
+      // let a conditional cd/assignment relocate a later unconditional command.
+      const scoped = new Map(env);
+      const scopedDirs = new Set(createdDirectories);
+      let branchCwd = cwd;
+      for (const child of node.namedChildren) {
+        if (child.type === "elif_clause" || child.type === "else_clause" || child.type === "case_item") {
+          visit(child, cwd, new Map(env), heredoc, depth + 1, new Set(createdDirectories));
+        } else {
+          branchCwd = visit(child, branchCwd, scoped, heredoc, depth + 1, scopedDirs);
+        }
+      }
+      return initialCwd;
+    }
     if (node.type === "redirected_statement") {
       const body = field(node, "body");
       const content = node.namedChildren.find((child) => child.type === "heredoc_redirect")
         ?.namedChildren.find((child) => child.type === "heredoc_body")?.text;
-      if (body) cwd = visit(body, cwd, content);
+      if (body) cwd = visit(body, cwd, env, content, depth, createdDirectories);
       // Redirects attached to a single command open before that command runs.
       // A list's trailing redirect belongs to its final command, after earlier cds.
       const redirectCwd = body?.type === "command" ? initialCwd : cwd;
       for (const child of node.namedChildren) {
         if (child.type === "file_redirect") {
           const dest = field(child, "destination");
-          const path = dest ? shellWord(dest) : undefined;
-          if (path && /^(\d*)?(?:>|>>|>\||&>|&>>)/.test(child.text.trim())) {
-            expand(path, redirectCwd).forEach((candidate) => add(candidate, redirectCwd));
+          const paths = strings(shellValue(dest, env));
+          if (paths && /^(\d*)?(?:>|>>|>\||&>|&>>)/.test(child.text.trim())) {
+            paths.forEach((path) => (dest?.type === "word" ? expand(path, redirectCwd) : [path])
+              .forEach((candidate) => add(candidate, redirectCwd)));
           }
         }
       }
@@ -313,7 +447,9 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
     }
     if (node.type === "subshell") {
       let localCwd = initialCwd;
-      for (const child of node.namedChildren) localCwd = visit(child, localCwd, heredoc);
+      const local = new Map(env);
+      const localDirs = new Set(createdDirectories);
+      for (const child of node.namedChildren) localCwd = visit(child, localCwd, local, heredoc, depth + 1, localDirs);
       return initialCwd;
     }
     if (node.type === "pipeline") {
@@ -324,25 +460,41 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
       // the piped commands themselves do not change its cwd.
       const firstBody = first.type === "redirected_statement" ? field(first, "body") : first;
       if (firstBody?.type === "list" && firstBody.namedChildren.length > 1) {
-        visit(first, initialCwd, heredoc);
+        visit(first, initialCwd, new Map(env), heredoc, depth, new Set(createdDirectories));
         let prefixCwd = initialCwd;
-        for (const part of firstBody.namedChildren.slice(0, -1)) prefixCwd = visit(part, prefixCwd, heredoc);
-        for (const child of rest) visit(child, prefixCwd, heredoc);
+        for (const part of firstBody.namedChildren.slice(0, -1)) prefixCwd = visit(part, prefixCwd, env, heredoc, depth, createdDirectories);
+        for (const child of rest) visit(child, prefixCwd, new Map(env), heredoc, depth, new Set(createdDirectories));
         return prefixCwd;
       }
-      visit(first, initialCwd, heredoc);
-      for (const child of rest) visit(child, initialCwd, heredoc);
+      visit(first, initialCwd, new Map(env), heredoc, depth, new Set(createdDirectories));
+      for (const child of rest) visit(child, initialCwd, new Map(env), heredoc, depth, new Set(createdDirectories));
       return initialCwd;
     }
     if (node.type === "command") {
-      const name = shellWord(field(node, "name")?.namedChildren[0] ?? field(node, "name")!);
-      const args = argsOf(node).map(shellWord);
+      const name = scalar(shellValue(field(node, "name"), env));
+      const args = argsOf(node).map((arg) => scalar(shellValue(arg, env)));
       if (name === "cd") {
-        if (args.length === 1 && args[0]) return resolve(cwd, args[0]);
+        if (args.length === 1 && args[0]) {
+          const directory = resolve(cwd, args[0]);
+          try { if (statSync(directory).isDirectory()) return directory; } catch { /* not present yet */ }
+          if (createdDirectories.has(directory)) return directory;
+        }
         return cwd;
       }
       if (!name) return cwd;
       const executable = name.split("/").pop()!;
+      if (executable === "mkdir") {
+        for (const arg of args) {
+          if (!arg || arg.startsWith("-")) continue;
+          const directory = resolve(cwd, arg);
+          createdDirectories.add(directory);
+          if (args.includes("-p") || args.includes("--parents")) {
+            for (let parent = dirname(directory); parent !== dirname(parent); parent = dirname(parent)) {
+              createdDirectories.add(parent);
+            }
+          }
+        }
+      }
       if (/^python(?:\d+(?:\.\d+)?)?$/.test(executable)) {
         const index = args.findIndex((arg) => arg === "-c");
         const source = index >= 0 ? args[index + 1] : heredoc;
@@ -379,11 +531,32 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
         const rest = script >= 0 ? args.slice(script + 2) : args.slice(2);
         rest.filter((arg) => arg && !arg.startsWith("-")).forEach((arg) => expand(arg!, cwd).forEach((file) => add(file, cwd)));
       }
+      // Direct filesystem commands: only statically named operands, never recursive directory trees.
+      const moving = executable === "mv" || (executable === "git" && args[0] === "mv");
+      const operands = (moving && executable === "git" ? args.slice(1) : args)
+        .filter((arg) => arg && !arg.startsWith("-")) as string[];
+      if (executable === "rm" && !args.some((arg) => arg === "--recursive" || /^-[a-z]*[rR]/.test(arg ?? ""))) {
+        operands.forEach((operand) => expand(operand, cwd).forEach((path) => add(path, cwd)));
+      }
+      const unsupportedLayout = args.some((arg) => arg === "-t" || arg === "--target-directory" ||
+        arg?.startsWith("--target-directory=") || (executable === "cp" && (arg === "--recursive" || /^-[a-zA-Z]*[rR]/.test(arg ?? ""))));
+      if ((executable === "cp" || moving) && !unsupportedLayout && operands.length >= 2) {
+        const destination = operands[operands.length - 1];
+        let directory = destination.endsWith("/") || operands.length > 2;
+        try { directory ||= statSync(resolve(cwd, destination)).isDirectory(); } catch { /* new destination */ }
+        for (const source of operands.slice(0, -1)) {
+          const sources = expand(source, cwd);
+          for (const file of sources) {
+            if (moving) add(file, cwd);
+            add(directory ? join(destination, basename(file)) : destination, cwd);
+          }
+        }
+      }
       return cwd;
     }
-    for (const child of node.namedChildren) cwd = visit(child, cwd, heredoc);
+    for (const child of node.namedChildren) cwd = visit(child, cwd, env, heredoc, depth, createdDirectories);
     return cwd;
   }
-  visit(root, resolve(cwd));
+  visit(root, resolve(cwd), new Map());
   return [...found].sort();
 }
