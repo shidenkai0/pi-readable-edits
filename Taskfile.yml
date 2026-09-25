@@ -1,0 +1,79 @@
+version: '3'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  install:
+    desc: Install dependencies with pnpm
+    cmds:
+      - pnpm install
+
+  test:
+    desc: Run parser, diff and Bash-wrapper tests
+    cmds:
+      - pnpm test
+
+  typecheck:
+    desc: Check TypeScript without emitting files
+    cmds:
+      - pnpm typecheck
+
+  corpus:
+    desc: Stream recent Bash calls into the private local corpus
+    cmds:
+      - pnpm corpus
+
+  eval:
+    desc: Refresh the corpus and evaluate target extraction
+    cmds:
+      - task: corpus
+      - pnpm eval
+
+  label:prepare:
+    desc: Shard the frozen private corpus for independent labeling
+    cmds:
+      - pnpm exec tsx scripts/label-corpus.ts prepare
+
+  label:normalize:
+    desc: Remove outside-project paths from private model labels, recording corrections
+    cmds:
+      - pnpm exec tsx scripts/label-corpus.ts normalize
+
+  label:assemble:
+    desc: Require one validated label per frozen corpus call
+    cmds:
+      - pnpm exec tsx scripts/label-corpus.ts assemble
+
+  eval:full:
+    desc: Evaluate against the frozen, fully labeled private corpus
+    cmds:
+      - task: label:assemble
+      - pnpm eval .local/luna-corpus.jsonl .local/labeling/all-labels.json
+
+  label:audit:
+    desc: Compare model labels against independent curated hand labels
+    cmds:
+      - task: label:assemble
+      - pnpm exec tsx scripts/audit-labels.ts
+
+  label:sample:
+    desc: Draw a deterministic blinded audit sample from the frozen corpus
+    cmds:
+      - task: label:assemble
+      - pnpm exec tsx scripts/sample-audit.ts
+
+  label:sample:compare:
+    desc: Compare blinded repeat labels after review shards have been written
+    cmds:
+      - task: label:assemble
+      - pnpm exec tsx scripts/audit-sample.ts
+
+  check:
+    desc: Run tests and typecheck (works without local transcripts)
+    cmds:
+      - task: test
+      - task: typecheck
+      - task: eval
