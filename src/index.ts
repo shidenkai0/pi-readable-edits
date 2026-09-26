@@ -1,65 +1,98 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { capture, compare, type DiffEntry } from "./diffs.js";
-import { extractTargets, scopeRoot } from "./targets.js";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Engine } from "./engine.js";
+import { sweepStaleState } from "./git.js";
+import { isReadOnly } from "./targets.js";
+import { CARD_TYPE, type EditCardData, renderCard } from "./render.js";
+import { EditTracker } from "./tracker.js";
 
-interface ReadableDetails {
-  edits?: DiffEntry[];
-  truncation?: unknown;
-  fullOutputPath?: string;
-}
+/** Tools that run arbitrary shell commands, and so may edit files without showing a diff. */
+const SHELL_TOOLS = new Set(["bash", "powershell"]);
 
 /**
- * Wraps Pi's normal bash tool. Recognition is intentionally best effort: an
- * unknown command runs and renders exactly like an ordinary bash command.
+ * Shows a diff card after shell commands that change files.
+ *
+ * Nothing about the shell tool itself changes: it is observed through tool
+ * events, so any bash implementation (sandboxed, remote, custom-rendered)
+ * keeps working. Cards are custom session entries, rendered for the user and
+ * never included in model context.
  */
 export default function readableEdits(pi: ExtensionAPI): void {
-  const original = createBashToolDefinition(process.cwd());
-  pi.registerTool({
-    ...original,
-    // Sibling tools must not overlap a before/after comparison.
-    executionMode: "sequential",
-    async execute(id, params, signal, onUpdate, ctx) {
-      let snapshots: Awaited<ReturnType<typeof capture>> = [];
-      let root = ctx.cwd;
-      try {
-        root = await scopeRoot(ctx.cwd);
-        snapshots = await capture(await extractTargets(params.command, ctx.cwd, root), root);
-      } catch {
-        // File inspection must never prevent the requested command from running.
+  let enabled = true;
+  let ui: ExtensionContext["ui"] | undefined;
+  const pending: EditCardData[] = [];
+  const engine = new Engine((message) => ui?.notify(`Readable edits: ${message}`, "warning"));
+  const tracker = new EditTracker(engine, (card) => pending.push(card));
+
+  const watching = (ctx: ExtensionContext) => enabled && (ctx.mode === "tui" || ctx.mode === "rpc");
+
+  pi.registerEntryRenderer<EditCardData>(CARD_TYPE, (entry, { expanded }, theme) =>
+    entry.data?.v === 1 && entry.data.files.length ? renderCard(entry.data, expanded, theme) : undefined);
+
+  pi.on("session_start", async (_event, ctx) => {
+    ui = ctx.ui;
+    tracker.reset();
+    pending.length = 0;
+    void sweepStaleState();
+  });
+
+  pi.on("tool_execution_start", (event, ctx) => {
+    if (watching(ctx)) tracker.toolStarted(event.toolCallId, event.toolName, event.args, ctx.cwd);
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    if (!watching(ctx) || !SHELL_TOOLS.has(event.toolName)) return;
+    const command = (event.input as { command?: unknown }).command;
+    if (typeof command !== "string") return;
+    // Most agent commands only read; skipping their snapshots keeps the shell fast.
+    if (event.toolName === "bash" && await isReadOnly(command).catch(() => false)) return;
+    // A tool_call handler that throws would block the command, so never let one escape.
+    await tracker.shellStarting(event.toolCallId, command, ctx.cwd).catch(() => {});
+  });
+
+  pi.on("tool_execution_end", async (event) => {
+    await tracker.toolEnded(event.toolCallId, event.isError);
+  });
+
+  // Tool results are persisted before turn_end, so cards land after the calls that caused them.
+  pi.on("turn_end", async (event) => {
+    await tracker.flush();
+    if (!pending.length) return;
+    const cards = pending.splice(0).map((data) => ({ type: "custom" as const, customType: CARD_TYPE, data }));
+    return { entries: [...event.entries, ...cards] };
+  });
+
+  pi.on("agent_end", async () => {
+    await tracker.flush();
+    for (const card of pending.splice(0)) pi.appendEntry(CARD_TYPE, card);
+  });
+
+  pi.on("session_shutdown", async () => {
+    tracker.reset();
+    await engine.dispose();
+  });
+
+  pi.registerCommand("readable-edits", {
+    description: "Show or toggle diff cards for shell edits (on, off, status)",
+    getArgumentCompletions: (prefix) => ["on", "off", "status"]
+      .filter((option) => option.startsWith(prefix.trim()))
+      .map((option) => ({ value: option, label: option })),
+    handler: async (args, ctx) => {
+      const choice = args.trim().toLowerCase();
+      if (choice === "on" || choice === "off") {
+        enabled = choice === "on";
+        if (!enabled) tracker.reset();
+        ctx.ui.notify(`Readable edits ${enabled ? "on" : "off"}`, "info");
+        return;
       }
-      const result = await original.execute(id, params, signal, onUpdate, ctx);
-      try {
-        const edits = await compare(snapshots, root);
-        if (edits.length) return { ...result, details: { ...result.details, edits } };
-      } catch {
-        // Preserve the original result if a file disappears or becomes unreadable.
+      const repositories = engine.status();
+      const lines = [`Readable edits: ${enabled ? "on" : "off"}`];
+      if (!repositories.length) lines.push("No shell commands observed yet in this session.");
+      for (const repo of repositories) {
+        lines.push(repo.mode === "git"
+          ? `${repo.root}: Git snapshots, ${repo.snapshots} taken, ${repo.averageMs}ms average`
+          : `${repo.root}: command parsing (${repo.reason})`);
       }
-      return result;
-    },
-    renderResult(result, options, theme, context) {
-      const edits = (result.details as ReadableDetails | undefined)?.edits ?? [];
-      const output = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
-      const lines = output.split("\n");
-      const outputLimit = options.expanded ? 200 : 10;
-      let body = lines.slice(0, outputLimit).map((line) => theme.fg("toolOutput", line)).join("\n");
-      if (lines.length > outputLimit) body += theme.fg("muted", `\n… ${lines.length - outputLimit} more output lines`);
-      if (context.isError) body = theme.fg("error", body);
-      if (options.isPartial) return new Text(body || "Running…", 0, 0);
-      if (edits.length) {
-        body += `\n${theme.fg("success", `Edits: ${edits.map((edit) => edit.path).join(", ")}`)}`;
-        const patch = edits.map((edit) => edit.patch).join("\n");
-        const patchLines = patch.split("\n");
-        const limit = options.expanded ? 400 : 24;
-        body += "\n" + patchLines.slice(0, limit).map((line) => {
-          if (line.startsWith("+") && !line.startsWith("+++")) return theme.fg("success", line);
-          if (line.startsWith("-") && !line.startsWith("---")) return theme.fg("error", line);
-          return theme.fg("dim", line);
-        }).join("\n");
-        if (patchLines.length > limit) body += theme.fg("muted", `\n… ${patchLines.length - limit} more diff lines (expand)`);
-      }
-      return new Text(body, 0, 0);
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 }

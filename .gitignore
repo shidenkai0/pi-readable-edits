@@ -2,3 +2,5 @@ node_modules/
 .local/
 test/.scratch-*/
 *.tsbuildinfo
+.scratch/
+__pycache__/

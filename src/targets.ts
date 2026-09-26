@@ -1,5 +1,6 @@
 import { opendirSync, statSync } from "node:fs";
 import { access } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import fg from "fast-glob";
 import { Language, Parser, type Node as SyntaxNode } from "web-tree-sitter";
@@ -30,10 +31,11 @@ let parsers: Promise<{ bash: Parser; python: Parser; javascript: Parser }> | und
 async function getParsers(): Promise<{ bash: Parser; python: Parser; javascript: Parser }> {
   parsers ??= (async () => {
     await Parser.init();
+    const require = createRequire(import.meta.url);
+    const wasmDirectory = dirname(require.resolve("@vscode/tree-sitter-wasm"));
     const load = async (name: string) => {
       const parser = new Parser();
-      const wasm = new URL(`../node_modules/@vscode/tree-sitter-wasm/wasm/tree-sitter-${name}.wasm`, import.meta.url);
-      parser.setLanguage(await Language.load(wasm.pathname));
+      parser.setLanguage(await Language.load(join(wasmDirectory, `tree-sitter-${name}.wasm`)));
       return parser;
     };
     return { bash: await load("bash"), python: await load("python"), javascript: await load("javascript") };
@@ -78,6 +80,12 @@ function shellValue(node: SyntaxNode | null, env: Environment): Value | undefine
       return env.get(field(variable, "name")?.text ?? "");
     }
     return undefined;
+  }
+  if (node.type === "number") return text(node.text);
+  if (node.type === "concatenation") {
+    // 'it'"'"'s' and similar quoting tricks: join the parts when each is a single string.
+    const parts = node.namedChildren.map((child) => scalar(shellValue(child, env)));
+    return parts.every((part) => part !== undefined) ? text(parts.join("")) : undefined;
   }
   if (node.type !== "word" && node.type !== "string") return undefined;
   const start = node.type === "string" ? 1 : 0;
@@ -427,15 +435,26 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
     }
     if (node.type === "redirected_statement") {
       const body = field(node, "body");
-      const content = node.namedChildren.find((child) => child.type === "heredoc_redirect")
-        ?.namedChildren.find((child) => child.type === "heredoc_body")?.text;
+      const heredocRedirect = node.namedChildren.find((child) => child.type === "heredoc_redirect");
+      const content = heredocRedirect?.namedChildren.find((child) => child.type === "heredoc_body")?.text;
       if (body) cwd = visit(body, cwd, env, content, depth, createdDirectories);
       // Redirects attached to a single command open before that command runs.
       // A list's trailing redirect belongs to its final command, after earlier cds.
       const redirectCwd = body?.type === "command" ? initialCwd : cwd;
-      for (const child of node.namedChildren) {
+      // In `cat <<EOF > out` or `cat <<EOF | tee out`, tree-sitter nests the
+      // trailing redirect or pipeline inside the heredoc redirect itself.
+      const nested = heredocRedirect?.namedChildren ?? [];
+      for (const child of nested) {
+        if (child.type !== "file_redirect" && child.type !== "heredoc_start" && child.type !== "heredoc_body" &&
+            child.type !== "heredoc_end") {
+          cwd = visit(child, cwd, env, undefined, depth + 1, createdDirectories);
+        }
+      }
+      for (const child of [...node.namedChildren, ...nested]) {
         if (child.type === "file_redirect") {
           const dest = field(child, "destination");
+          // `2>&1` and `>&-` duplicate or close descriptors; they name no file.
+          if (/^\d*>&/.test(child.text.trim()) && (dest?.type === "number" || dest?.text === "-")) continue;
           const paths = strings(shellValue(dest, env));
           if (paths && /^(\d*)?(?:>|>>|>\||&>|&>>)/.test(child.text.trim())) {
             paths.forEach((path) => (dest?.type === "word" ? expand(path, redirectCwd) : [path])
@@ -508,28 +527,40 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
       if (executable === "tee") {
         args.filter((arg) => arg && !arg.startsWith("-")).forEach((arg) => add(arg!, cwd));
       }
-      if (executable === "sed" && args.some((arg) => arg === "-i" || arg?.startsWith("-i"))) {
-        const rest = args.slice(args.findIndex((arg) => arg === "-i" || arg?.startsWith("-i")) + 1);
-        if (rest[0] === "") rest.shift(); // BSD sed -i '' script file
-        let hasProgram = false;
-        for (let i = 0; i < rest.length; i++) {
-          const arg = rest[i];
+      if (executable === "sed" && args.some((arg) => arg === "-i" || /^-[a-zA-Z]*i/.test(arg ?? "") || arg?.startsWith("--in-place"))) {
+        let hasProgram = args.some((arg) => arg === "-e" || arg === "--expression" || arg === "-f" || arg === "--file" ||
+          arg?.startsWith("--expression=") || arg?.startsWith("--file="));
+        for (let i = 0; i < args.length; i++) {
+          const arg = args[i];
           if (arg === "-e" || arg === "--expression" || arg === "-f" || arg === "--file") {
-            hasProgram = true;
             i++; // The next argument is a sed program or a program file, not an edited file.
-          } else if (!arg || arg.startsWith("-")) {
+          } else if (arg === "-i" && args[i + 1] === "" ) {
+            i++; // BSD sed -i '' takes an empty backup suffix.
+          } else if (arg?.startsWith("-")) {
             continue;
           } else if (!hasProgram) {
-            hasProgram = true;
-          } else {
+            hasProgram = true; // Even an unresolved program occupies this position.
+          } else if (arg !== undefined) {
             expand(arg, cwd).forEach((file) => add(file, cwd));
           }
         }
       }
-      if (executable === "perl" && args.some((arg) => /^-[a-z]*i/.test(arg ?? ""))) {
-        const script = args.findIndex((arg) => arg === "-e");
-        const rest = script >= 0 ? args.slice(script + 2) : args.slice(2);
-        rest.filter((arg) => arg && !arg.startsWith("-")).forEach((arg) => expand(arg!, cwd).forEach((file) => add(file, cwd)));
+      if ((executable === "perl" || executable === "ruby") && args.some((arg) => /^-[a-zA-Z]*i/.test(arg ?? ""))) {
+        // `-e`/`-E` (possibly bundled, as in `-pe`) take the program as the next argument.
+        let hasProgram = false;
+        for (let i = 0; i < args.length; i++) {
+          const arg = args[i];
+          if (arg !== undefined && /^-[a-zA-Z.]*[eE]$/.test(arg)) {
+            hasProgram = true;
+            i++;
+          } else if (arg?.startsWith("-")) {
+            continue;
+          } else if (!hasProgram) {
+            hasProgram = true; // First operand is a script file.
+          } else if (arg !== undefined) {
+            expand(arg, cwd).forEach((file) => add(file, cwd));
+          }
+        }
       }
       // Direct filesystem commands: only statically named operands, never recursive directory trees.
       const moving = executable === "mv" || (executable === "git" && args[0] === "mv");
@@ -559,4 +590,80 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
   }
   visit(root, resolve(cwd), new Map());
   return [...found].sort();
+}
+
+/** Programs that never write files, given the argument checks in `readOnlyInvocation`. */
+const READ_ONLY_PROGRAMS = new Set([
+  "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "ag", "fd", "tree", "pwd", "echo", "printf",
+  "which", "type", "command", "file", "stat", "du", "df", "jq", "cut", "tr", "diff", "cmp", "basename", "dirname",
+  "realpath", "readlink", "date", "true", "false", "test", "[", "sleep", "nl", "column", "od", "hexdump", "md5",
+  "md5sum", "shasum", "sha256sum", "ps", "whoami", "uname", "id", "hostname", "nproc", "cd", "less", "more", "bat",
+  "sed", "awk", "sort", "find", "git", "uniq",
+]);
+const READ_ONLY_GIT = new Set([
+  "status", "log", "diff", "show", "rev-parse", "ls-files", "ls-tree", "blame", "describe", "shortlog", "grep",
+  "cat-file", "rev-list", "merge-base", "branch", "remote", "config", "reflog", "name-rev", "for-each-ref",
+]);
+
+function readOnlyInvocation(name: string, args: Array<string | undefined>): boolean {
+  if (!READ_ONLY_PROGRAMS.has(name)) return false;
+  const has = (pattern: RegExp) => args.some((arg) => arg === undefined || pattern.test(arg));
+  switch (name) {
+    case "sed": return !has(/^-[a-zA-Z]*i|^--in-place/) && !has(/^-[a-zA-Z]*[wW]/) && !args.some((arg) => arg && /(^|;|\s)w\s/.test(arg));
+    case "awk": return !has(/^-i|inplace/) && !args.some((arg) => arg && />|system|print\s*>/.test(arg));
+    case "sort": return !has(/^-[a-zA-Z]*o|^--output/);
+    case "uniq": return args.filter((arg) => arg && !arg.startsWith("-")).length <= 1;
+    case "find": return !has(/^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/);
+    case "git": {
+      const sub = args.find((arg) => arg && !arg.startsWith("-"));
+      if (!sub || !READ_ONLY_GIT.has(sub)) return false;
+      if (sub === "branch" || sub === "remote" || sub === "config") {
+        // Listing forms only; these subcommands also have writing forms.
+        return args.slice(args.indexOf(sub) + 1).every((arg) => arg !== undefined && /^(-[alrv]+|--(list|all|show-current|get\S*|verbose))$/.test(arg));
+      }
+      return !has(/^--output/);
+    }
+    default: return true;
+  }
+}
+
+/**
+ * True when the command provably cannot change project files: every program
+ * is a known reader, and every redirect is an input, a descriptor duplicate,
+ * or /dev/null. Anything unrecognized counts as writing.
+ */
+export async function isReadOnly(command: string): Promise<boolean> {
+  if (Buffer.byteLength(command) > MAX_COMMAND_BYTES) return false;
+  const { bash } = await getParsers();
+  const root = bash.parse(command)?.rootNode;
+  if (!root || root.hasError) return false;
+  let visits = 0;
+  const safe = (node: SyntaxNode): boolean => {
+    if (++visits > MAX_VISITS) return false;
+    switch (node.type) {
+      case "program": case "list": case "pipeline": case "subshell": case "compound_statement": case "negated_command":
+      case "redirected_statement": case "command_substitution": case "string": case "concatenation": case "word":
+      case "raw_string": case "string_content": case "simple_expansion": case "expansion": case "variable_name":
+      case "number": case "comment": case "heredoc_redirect": case "heredoc_start": case "heredoc_body": case "heredoc_end":
+      case "herestring_redirect": case "ansi_c_string": case "special_variable_name": case "command_name":
+        return node.namedChildren.every(safe);
+      case "file_redirect": {
+        const operator = node.text.trim().replace(/^\d+/, "");
+        if (operator.startsWith("<")) return true;
+        if (/^>&\d*-?$|^>&\s*\d+$/.test(operator)) return true;
+        return field(node, "destination")?.text === "/dev/null";
+      }
+      case "command": {
+        const nameNode = field(node, "name");
+        if (!nameNode || nameNode.namedChildren[0]?.type !== "word") return false;
+        const name = nameNode.text.split("/").pop()!;
+        const argNodes = argsOf(node);
+        const args = argNodes.map((arg) => scalar(shellValue(arg, new Map())));
+        return readOnlyInvocation(name, args) && argNodes.every(safe);
+      }
+      default:
+        return false;
+    }
+  };
+  return safe(root);
 }

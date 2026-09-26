@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { extractTargets } from "../src/targets.js";
+import { extractTargets, isReadOnly } from "../src/targets.js";
 
 let root: string;
 before(async () => {
@@ -232,4 +232,36 @@ test("unknown targets, builds and out-of-project paths keep ordinary shell displ
   assert.deepEqual(await targets("cat > ../outside.txt <<'EOF'\nx\nEOF"), []);
   assert.deepEqual(await targets("cat > /tmp/outside.txt <<'EOF'\nx\nEOF"), []);
   assert.deepEqual(await targets("cd /tmp && cat > outside.txt <<'EOF'\nx\nEOF"), []);
+});
+
+test("heredocs before redirects or pipes still resolve their destinations", async () => {
+  assert.deepEqual(await targets("cat <<'EOF' > new.ts\nhello\nEOF"), ["new.ts"]);
+  assert.deepEqual(await targets("cat << EOF | tee piped.ts\nhello\nEOF"), ["piped.ts"]);
+  assert.deepEqual(await targets("cat <<'EOF' > a.ts && echo x > b.ts\nhello\nEOF"), ["a.ts", "b.ts"]);
+});
+
+test("sed and perl in-place flags work in any position, with bundled or unresolved programs", async () => {
+  assert.deepEqual(await targets("sed -e 's/a/b/' -i course/lessons/01.html"), ["course/lessons/01.html"]);
+  assert.deepEqual(await targets("sed -n 's/a/b/p' course/lessons/01.html"), []);
+  assert.deepEqual(await targets("perl -i -pe 's/a/b/' course/lessons/01.html"), ["course/lessons/01.html"]);
+  assert.deepEqual(await targets("ruby -i -pe 'gsub(/a/, \"b\")' course/lessons/02.html"), ["course/lessons/02.html"]);
+  assert.deepEqual(await targets(`sed -i '' 's/it/it'"'"'s/' course/lessons/01.html`), ["course/lessons/01.html"]);
+  assert.deepEqual(await targets(`sed -i "s/$(date)/x/" course/lessons/02.html`), ["course/lessons/02.html"]);
+});
+
+test("read-only classification skips only commands that provably cannot write", async () => {
+  const readers = [
+    "ls -la", "rg -n foo src | head -20", "git status --short && git diff --stat", "cat a.txt 2>/dev/null || echo missing",
+    "sed -n '1,20p' file.ts", "cd src && grep -rn x .", "git log --oneline -5 2>&1", "echo $(git rev-parse HEAD)",
+    "find . -name '*.ts' -not -path './node_modules/*'", "wc -l < file.txt", "git branch --show-current",
+    "cat <<'EOF'\nhello\nEOF",
+  ];
+  const writers = [
+    "echo hi > out.txt", "sed -i 's/a/b/' f", "find . -delete", "find . -exec rm {} +", "sort -o out.txt in.txt",
+    "git checkout -- f", "git branch new-feature", "xargs rm < list", "cat a | tee b", "python3 script.py", "npm test",
+    "echo $(rm -rf x)", "awk '{print > \"out\"}' f", "git config user.name x", "$EDITOR file", "uniq in out",
+    "cat <<'EOF' > f\nx\nEOF", "ls; touch x",
+  ];
+  for (const command of readers) assert.equal(await isReadOnly(command), true, command);
+  for (const command of writers) assert.equal(await isReadOnly(command), false, command);
 });

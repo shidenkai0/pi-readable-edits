@@ -1,52 +1,66 @@
 # Readable edits for Pi
 
-Show a file diff when an agent uses Bash to make a routine edit instead of Pi's edit tool.
+When an agent changes files through `bash` (`sed -i`, a heredoc, a Python one-off, a formatter, a codemod), Pi shows you the command, not the change. This extension adds a diff card right after the command, in the same style as Pi's own `edit` tool.
 
-Inline Python, `cat > file`, and in-place `sed` can leave you staring at a shell command with no clear view of what changed. This Pi extension recognizes common direct-write patterns, captures **only their resolved project files**, and adds their actual before/after diff to the Bash result. An unrecognized command runs and displays normally. This is a readability aid, not a filesystem audit.
+![A diff card after a Python heredoc that edited three files](docs/card.png)
 
-## Try it
-
-Requires Node.js, pnpm, and [Pi](https://pi.dev/).
+## Install
 
 ```sh
-pnpm install
-pi --extension ./src/index.ts
+pi install git:github.com/shidenkai0/pi-readable-edits
 ```
 
-The example loads the extension while Pi runs in this directory. To use it in another project, start Pi there with the **absolute path** to this repository's `src/index.ts`.
+Or try it for a single session without installing: `pi -e git:github.com/shidenkai0/pi-readable-edits`.
 
-For example, a Bash call like `python3 -c 'from pathlib import Path; Path("app.ts").write_text("new")'` displays its normal output followed by an expandable diff for `app.ts`.
+Nothing to configure. The card shows up the first time a shell command changes a file.
 
-## What it recognizes
+## What you see
 
-- Bash file redirects (`>`, `>>`, and heredocs), `tee`, BSD/GNU `sed -i`, `perl -pi`, and direct `cp`, `mv`, `git mv`, or nonrecursive `rm` of named files.
-- Embedded `python -c` or heredoc source: `open(..., "w"/"a"/"x")`, `Path.write_text`/`write_bytes`, and a small set of direct file operations. Inline Node.js `writeFile`/`writeFileSync` is also recognized.
-- Literal paths, simple assignments, joins, finite lists and dictionaries, globs, and small local helpers. Bash assignments, arrays, variable expansions, and finite `for` loops also resolve when their paths are static. Paths are limited to the current Git worktree (or the Pi working directory outside Git).
+- **Every change a command made:** creations, deletions, renames, mode changes and binary files, from any program the command ran. One file gets a titled diff. Several get a file list with `+/−` counts, then a diff per file.
+- **Pi's own diff rendering:** the same colors, line numbers and word-level highlights as the `edit` tool, with long lines wrapped under a hanging indent.
+- **Short by default:** small diffs show in full. Large ones show a preview and expand with Pi's usual key (`ctrl+o`).
+- **Safe to keep:** `.env*`, keys and credential files show line counts but never contents. Lockfiles and generated files stay collapsed.
+- **Honest attribution:** a failed command is marked `failed`. Commands that ran in parallel share one card. Files that Pi's `edit`/`write` tools changed at the same time are left to those tools' own diffs.
 
-Only changed, readable text files up to 256 KiB appear in the diff. Symlinks, external paths, binaries, and unresolved expressions retain the normal Bash display. Builds and tests are not analyzed for incidental output files. Parsing and loop expansion are bounded; glob expansion requires a literal parent directory and skips directories with more than 4,096 entries. The extension does not execute code to infer paths. Diffs live in tool-result details for the UI, **not in model-facing output**. Large or unusual shell commands may have no diff.
+The card is a session entry for you only. It is **never sent to the model**, and the command's own output is untouched.
 
-## Develop and evaluate
+## How it works
+
+Before a shell command runs, the extension snapshots the Git worktree. It stages every non-ignored file into a *private* index and object store in a temp directory, seeded from your index so Git's stat cache keeps it fast. When the command finishes, it snapshots again and diffs the two trees. Your real index, `.git/objects` and working tree are never written.
+
+- **It doesn't matter how the edit happened.** `apply_patch`, `black`, `prettier --write`, a script written to `/tmp` and then run: anything that changes files shows up. `.gitignore` keeps build output and `node_modules` out.
+- **Commands that only read are skipped.** A strict parser recognizes read-only commands (`ls`, `rg`, `cat`, `git status`, `sed -n`, …) and skips snapshots for them. That covered 61% of 4,944 real agent commands, with no real edit misclassified. Anything it doesn't recognize is snapshotted.
+- **It never gets in the way.** If a snapshot fails or times out, the command still runs. Repositories whose snapshots are consistently slow (over 1.5 s twice, or one over 4 s) switch to the fallback below, and you get a one-time notice.
+- **Outside Git** (or in a repository that fell back), the extension statically parses the command for the files it names (redirects, heredocs, `tee`, `sed -i`, `perl -i`, `cp`, `mv`, `rm`, and file writes in inline Python and Node) and diffs just those.
+- **It composes.** It observes Pi's tool events instead of replacing the `bash` tool, so sandboxed, remote or custom-rendered `bash` implementations keep working.
+
+Typical overhead for a command that may write is two snapshots: about 50 ms each in a 1,000-file repository, and 130 ms in VS Code's 19,000 files.
+
+## Commands
+
+`/readable-edits status` shows how each repository is observed and the average snapshot time. `/readable-edits off` and `/readable-edits on` pause and resume observation.
+
+## Limits
+
+- Only the Git worktree containing Pi's working directory is observed. Edits in other repositories or in `/tmp` don't appear.
+- Ignored files never appear. Submodules show commit changes, not their contents.
+- Changes something else makes while a command is running (your editor, a watcher writing tracked files) are included in that command's card.
+- Outside Git, the fallback only sees files a command names directly.
+- Cards render in Pi's terminal UI. They are stored in the session with diffs capped at 2,400 lines per card.
+
+## Develop
+
+From a checkout, `pnpm install`, then load your working copy with `pi -e "$PWD"`.
 
 ```sh
-task test       # unit and wrapped-Bash integration tests
-task typecheck
-task eval       # refresh private corpus; run labeled evaluation
-task eval:full  # evaluate the frozen corpus against complete model labels
-task check      # tests and typecheck; works without local transcripts
+task check      # tests (Git engine, parser, tracker, rendering, extension) and typecheck
+task preview    # render sample cards to .scratch/cards.png with Pi's real theme
+task demo       # run real Pi with a scripted model; screenshots in .scratch/
+task eval       # score the fallback parser against your local, private transcript labels
 ```
 
-`task corpus` streams Bash calls from `~/.claude/projects` and `~/.codex/sessions`, taking the 12 most recently modified transcripts from each by default, plus sessions referenced by local labels. Set `CORPUS_SESSIONS=20` to widen the sample. The raw corpus and hand-labeled `.local/gold.json` stay under gitignored `.local/`; they may contain private commands and paths. `task eval` reports total Bash calls, resolved-target calls, parser time, and exact path-set accuracy **only for labeled calls**. Labels are curated rather than randomly sampled: their accuracy is not a population-wide coverage estimate.
+`task demo` drives a real Pi TUI in a pseudo-terminal with a scripted model (`scripts/demo/`). It uses an isolated config directory, so your personal Pi settings and extensions don't leak in. It needs [`uv`](https://docs.astral.sh/uv/). It is also how `docs/card.png` is made.
 
-To label your own calls, inspect `.local/corpus.jsonl` locally and add objects such as `{"id":"<command hash>","session":"<session filename>","paths":["src/file.ts"]}` to `.local/gold.json`. Paths are relative to each call's recorded working directory; use `[]` for a non-edit call. The evaluator prints target mismatches without writing transcript contents into the repository.
+### Fallback parser evaluation
 
-For a complete private reference set, freeze a corpus (`pnpm corpus .local/luna-corpus.jsonl`), run `task label:prepare`, and independently label each shard in `.local/labeling/shards/` as a JSON array in `.local/labeling/labels/` with `{ "key": 0, "kind": "edit", "paths": ["repo/relative.ts"] }`. Include *every* key; `other` has an empty path set, and `uncertain` flags unresolved direct project edits. These labels use **Git-root-relative paths**, unlike the older cwd-relative hand labels. Run `task label:normalize` to discard outside-root paths (recording each correction), then `task eval:full` to reject incomplete or misaligned labels and score the frozen calls. `task eval` still runs the separate curated hand-gold check. A model reference set is **not verified ground truth**; its scores must be read alongside a human audit and the hand-gold evaluation. Corpus contents and labels remain private in `.local/`.
-
-### Frozen local evaluation
-
-Corpus SHA-256 `0a4266587a5375d170dc4726101cc20ab34e8b71da943470aa1b291a4a1eeaa1`: 4,944 calls (Claude Code 1,154; Codex 3,790). Luna labeled 4,315 distinct command/working-directory pairs; duplicates expand to all 4,944 calls. After review of invalid paths and disagreements, labels classify 211 direct project-edit calls, 4,706 other calls, and 27 uncertain calls.
-
-Against that **model-labeled reference**, `task eval:full` now reports **203/211 (96.21%) complete edit target sets**, **4/4,706 negative calls with a candidate target**, and **352/365 (96.44%) path precision / 352/370 (95.14%) path recall**. Before the finite-value and direct-file-command changes, the same reference gave 192/211 complete sets and 263/370 path recall. The 27 uncertain calls are excluded from accuracy denominators. Parser-only time is about 0.4 s for 4,944 calls (about 0.08 ms/call); filesystem snapshot and command execution are not included. Some disagreements reflect imperfect labels: the four negative candidates include direct file deletion, direct file creation, and a directory move; only changed text files can produce UI diffs.
-
-The separate curated hand set has 54/54 positive exact sets and 0/7 negative candidates after correcting its omitted copy targets; it is intentionally non-random. A 110-call deterministic stratified blind **same-model repeat** agreed on 107 labels after manual adjudication; that is a consistency check, not independent proof of ground-truth accuracy. Neither score establishes population-wide recall of edits Luna may have mislabeled as non-edits.
-
-The current Pi TUI renders the diff on the Bash tool result. Other frontends must render the stored tool details themselves.
+`task eval` streams Bash calls from `~/.claude/projects` and `~/.codex/sessions` into the gitignored `.local/` and scores the parser against labels there. On a frozen private set of 4,944 calls, labeled by a model (a reference, not verified ground truth), the parser finds the exact target set for 204 of 211 edit calls, with 4 false positives among 4,706 other calls, at 0.08 ms per call. Five of the seven misses are commands no parser can follow, like running a generated script or a formatter. Git mode catches those.

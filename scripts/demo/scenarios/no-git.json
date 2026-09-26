@@ -1,0 +1,19 @@
+{
+  "name": "notes",
+  "git": false,
+  "prompt": "Fix the typo in the notes",
+  "files": {
+    "notes.md": "# Notes\n\nTeh meeting is on Friday.\n",
+    "todo.txt": "- ship it\n"
+  },
+  "steps": [
+    {
+      "bash": [
+        "sed -i '' 's/Teh/The/' notes.md && echo '- write docs' >> todo.txt"
+      ]
+    },
+    {
+      "text": "Done."
+    }
+  ]
+}

@@ -11,9 +11,6 @@ importers:
       '@vscode/tree-sitter-wasm':
         specifier: 0.3.1
         version: 0.3.1
-      diff:
-        specifier: ^8.0.2
-        version: 8.0.4
       fast-glob:
         specifier: ^3.3.3
         version: 3.3.3
@@ -21,6 +18,9 @@ importers:
         specifier: ^0.27.0
         version: 0.27.0
     devDependencies:
+      '@earendil-works/pi-ai':
+        specifier: 0.87.1
+        version: 0.87.1(ws@8.21.3)
       '@earendil-works/pi-coding-agent':
         specifier: 0.87.1
         version: 0.87.1(ws@8.21.3)

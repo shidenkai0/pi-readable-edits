@@ -1,67 +1,120 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { after, before, test } from "node:test";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import readableEdits from "../src/index.js";
+import type { EditCardData } from "../src/render.js";
+import { cleanup, directory, piTheme, plain, repository, sh } from "./helpers.js";
 
-let work: string;
-let tool: ToolDefinition<any, any>;
-const context = () => ({
-  cwd: process.cwd(),
-  sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
-});
-before(async () => {
-  await mkdir("test", { recursive: true });
-  work = await mkdtemp(join(process.cwd(), "test", ".scratch-"));
+type Handler = (event: any, ctx: any) => unknown;
+
+/** Loads the extension into a minimal stand-in for Pi's extension runtime. */
+function load() {
+  const handlers = new Map<string, Handler[]>();
+  const appended: Array<{ customType: string; data: unknown }> = [];
+  const notices: string[] = [];
+  let renderer: ((entry: any, options: any, theme: Theme) => any) | undefined;
+  let command: ((args: string, ctx: any) => Promise<void>) | undefined;
   readableEdits({
-    registerTool(definition: ToolDefinition<any, any>) { tool = definition; },
-  } as unknown as ExtensionAPI);
-});
-after(async () => { await rm(work, { recursive: true, force: true }); });
+    on: (event: string, handler: Handler) => { handlers.set(event, [...(handlers.get(event) ?? []), handler]); return () => {}; },
+    registerEntryRenderer: (_type: string, fn: typeof renderer) => { renderer = fn; },
+    registerCommand: (_name: string, options: { handler: typeof command }) => { command = options.handler; },
+    appendEntry: (customType: string, data: unknown) => appended.push({ customType, data }),
+  } as any);
+  const emit = async (event: string, payload: object, ctx: object) => {
+    let result: unknown;
+    for (const handler of handlers.get(event) ?? []) result = await handler({ type: event, ...payload }, ctx);
+    return result;
+  };
+  return { emit, appended, notices, render: () => renderer!, command: () => command! };
+}
 
-test("wrapped Bash executes normally and attaches an actual diff outside model content", async () => {
-  const file = join(work, "edit.ts");
-  await writeFile(file, "old\n");
-  const command = `printf 'new\\n' > test/${work.split("/").pop()}/edit.ts; echo done`;
-  const result = await tool.execute("test-call", { command }, undefined, undefined, context() as any);
-  assert.equal(await readFile(file, "utf8"), "new\n");
-  assert.match(JSON.stringify(result.content), /done/);
-  assert.doesNotMatch(JSON.stringify(result.content), /-old/);
-  assert.match(result.details.edits[0].patch, /-old/);
-  assert.match(result.details.edits[0].patch, /\+new/);
-  const rendered = tool.renderResult!(result, { expanded: true, isPartial: false },
-    { fg: (_kind: string, text: string) => text } as any, { isError: false } as any).render(100).join("\n");
-  assert.match(rendered, /Edits: test\/\.scratch-/);
-  assert.match(rendered, /-old/);
-  assert.match(rendered, /\+new/);
+function context(cwd: string, notices: string[] = [], mode = "tui") {
+  return { cwd, mode, hasUI: true, ui: { notify: (message: string) => notices.push(message) } };
+}
+
+/** Runs one shell tool call through the same event sequence Pi uses. */
+async function bash(pi: ReturnType<typeof load>, ctx: object & { cwd: string }, id: string, command: string, fail = false) {
+  await pi.emit("tool_execution_start", { toolCallId: id, toolName: "bash", args: { command } }, ctx);
+  await pi.emit("tool_call", { toolCallId: id, toolName: "bash", input: { command } }, ctx);
+  sh(command, ctx.cwd);
+  await pi.emit("tool_execution_end", { toolCallId: id, toolName: "bash", result: {}, isError: fail }, ctx);
+}
+
+const roots: string[] = [];
+let theme: Theme;
+before(async () => { theme = await piTheme(); });
+after(() => cleanup(...roots));
+
+test("a bash edit becomes a card appended after the turn's tool results, chained with other extensions' entries", async () => {
+  const root = await repository({ "src/app.ts": "const port = 3000;\n" });
+  roots.push(root);
+  const pi = load();
+  const ctx = context(root);
+  await pi.emit("session_start", { reason: "startup" }, ctx);
+  await bash(pi, ctx, "call-1", "sed -i.bak 's/3000/8080/' src/app.ts && rm src/app.ts.bak");
+  const other = { type: "custom", customType: "someone-else", data: {} };
+  const result = await pi.emit("turn_end", { entries: [other] }, ctx) as { entries: any[] };
+  assert.equal(result.entries[0], other);
+  const card = result.entries[1].data as EditCardData;
+  assert.equal(result.entries[1].customType, "readable-edits");
+  assert.deepEqual(card.files.map((file) => [file.path, file.added, file.removed]), [["src/app.ts", 1, 1]]);
+  assert.equal(card.mode, "git");
+
+  const lines = plain(pi.render()({ data: card }, { expanded: false }, theme).render(90));
+  assert.ok(lines.some((line) => line.startsWith("✎ Edited src/app.ts  +1 −1")));
+  assert.ok(lines.includes("-1 const port = 3000;") && lines.includes("+1 const port = 8080;"));
+  assert.equal(await pi.emit("turn_end", { entries: [] }, ctx), undefined, "cards are delivered once");
 });
 
-test("unrecognized command returns the normal result without an edits field", async () => {
-  const result = await tool.execute("test-call-2", { command: "echo plain" }, undefined, undefined, context() as any);
-  assert.match(JSON.stringify(result.content), /plain/);
-  assert.equal(result.details?.edits, undefined);
+test("read-only commands are not snapshotted, and print mode is never observed", async () => {
+  const root = await repository({ "a.txt": "a\n" });
+  roots.push(root);
+  const pi = load();
+  const notices: string[] = [];
+  await bash(pi, context(root), "read", "cat a.txt && git status --short");
+  assert.equal(await pi.emit("turn_end", { entries: [] }, context(root)), undefined);
+  await pi.command()("status", context(root, notices));
+  assert.match(notices[0]!, /No shell commands observed yet/);
+  const print = context(root, [], "print");
+  await bash(pi, print, "print", "echo b > a.txt");
+  assert.equal(await pi.emit("turn_end", { entries: [] }, print), undefined);
 });
 
-test("finite Python mapping and direct shell commands attach only changed text diffs", async () => {
-  const folder = `test/${work.split("/").pop()}`;
-  await writeFile(join(work, "a.md"), "before a\n");
-  await writeFile(join(work, "b.md"), "before b\n");
-  const python = `python3 - <<'PY'
-fixes = {'${folder}/a.md': 'after a\\n', '${folder}/b.md': 'after b\\n'}
-for path, content in fixes.items():
-    open(path, 'w').write(content)
-PY`;
-  const edited = await tool.execute("test-mapping", { command: python }, undefined, undefined, context() as any);
-  assert.deepEqual(edited.details.edits.map((entry: { path: string }) => entry.path), [
-    `${folder}/a.md`, `${folder}/b.md`,
-  ]);
-  assert.doesNotMatch(JSON.stringify(edited.content), /before a/);
-  await writeFile(join(work, "gone.md"), "remove me\n");
-  const moved = await tool.execute("test-file-ops", {
-    command: `cp ${folder}/a.md ${folder}/copy.md && rm ${folder}/gone.md`,
-  }, undefined, undefined, context() as any);
-  assert.deepEqual(moved.details.edits.map((entry: { path: string }) => entry.path), [
-    `${folder}/copy.md`, `${folder}/gone.md`,
-  ]);
+test("outside Git, files the command names are still diffed", async () => {
+  const root = await directory({ "notes.md": "Teh plan\n" });
+  roots.push(root);
+  const pi = load();
+  const ctx = context(root);
+  await bash(pi, ctx, "c", "cat <<'EOF' > notes.md\nThe plan\nEOF");
+  const result = await pi.emit("turn_end", { entries: [] }, ctx) as { entries: any[] };
+  const card = result.entries[0].data as EditCardData;
+  assert.equal(card.mode, "targeted");
+  assert.deepEqual(card.files.map((file) => file.path), ["notes.md"]);
+});
+
+test("a run that ends without turn_end still records its card", async () => {
+  const root = await repository({ "a.txt": "a\n" });
+  roots.push(root);
+  const pi = load();
+  const ctx = context(root);
+  await pi.emit("tool_call", { toolCallId: "x", toolName: "bash", input: { command: "echo b > a.txt" } }, ctx);
+  sh("echo b > a.txt", root);
+  await pi.emit("agent_end", { messages: [] }, ctx);
+  assert.equal(pi.appended.length, 1);
+  assert.equal(pi.appended[0]!.customType, "readable-edits");
+});
+
+test("the command toggles observation and reports how each repository is watched", async () => {
+  const root = await repository({ "a.txt": "a\n" });
+  roots.push(root);
+  const pi = load();
+  const notices: string[] = [];
+  const ctx = context(root, notices);
+  await pi.command()("off", ctx);
+  await bash(pi, ctx, "1", "echo b > a.txt");
+  assert.equal(await pi.emit("turn_end", { entries: [] }, ctx), undefined);
+  await pi.command()("on", ctx);
+  await bash(pi, ctx, "2", "echo c > a.txt");
+  await pi.command()("", ctx);
+  assert.match(notices.at(-1)!, /Readable edits: on\n.*: Git snapshots, 2 taken, \d+ms average/);
 });
