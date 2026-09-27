@@ -1,7 +1,14 @@
 import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Fixtures live under test/.scratch-* (gitignored), not the system temp
+ * directory: writes to temp directories are scratch work the extension ignores.
+ */
+export const fixtureParent = dirname(fileURLToPath(import.meta.url));
+export const fixture = () => mkdtemp(join(fixtureParent, ".scratch-"));
 
 export function sh(command: string, cwd: string): string {
   return execFileSync("bash", ["-c", command], { cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
@@ -9,7 +16,7 @@ export function sh(command: string, cwd: string): string {
 
 /** A committed repository with the given files. Remove it with `cleanup`. */
 export async function repository(files: Record<string, string>): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "readable-edits-test-"));
+  const root = await fixture();
   await writeFiles(root, files);
   sh("git init -q -b main && git -c user.email=t@example.com -c user.name=T add -A && " +
     "git -c user.email=t@example.com -c user.name=T commit -qm init", root);
@@ -17,7 +24,7 @@ export async function repository(files: Record<string, string>): Promise<string>
 }
 
 export async function directory(files: Record<string, string>): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "readable-edits-test-"));
+  const root = await fixture();
   await writeFiles(root, files);
   return root;
 }

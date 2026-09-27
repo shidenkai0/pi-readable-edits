@@ -1,5 +1,6 @@
 import { keyHint, renderDiff, type Theme } from "@earendil-works/pi-coding-agent";
-import { isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   Box, type Component, getCapabilities, hyperlink, sliceByColumn, truncateToWidth, visibleWidth, wrapTextWithAnsi,
@@ -18,7 +19,8 @@ export interface EditCardData {
   /** Paths changed concurrently by Pi's edit/write tools, which render their own diffs. */
   shownElsewhere?: string[];
   failed?: boolean;
-  mode: "git" | "targeted";
+  /** Set by 0.2 cards (Git snapshot or parser); unused since. */
+  mode?: string;
   /** Directory the paths are relative to; used for clickable links. */
   cwd?: string;
 }
@@ -167,9 +169,6 @@ class CardBody implements Component {
       if (parts.length) notes.push(theme.fg("muted", `… ${parts.join(", ")} (`) + keyHint("app.tools.expand", "to expand") + theme.fg("muted", ")"));
     } else {
       if (data.omittedFiles) notes.push(theme.fg("muted", `${data.omittedFiles} more changed files not stored`));
-      if (data.mode === "targeted") {
-        notes.push(theme.fg("dim", "Outside Git, only files named by the command are compared."));
-      }
       if (data.commands.length > 1) {
         notes.push(theme.fg("dim", `Combined changes from ${data.commands.length} commands that ran at the same time:`));
         for (const command of data.commands) notes.push(theme.fg("dim", `  $ ${firstLine(command)}`));
@@ -244,7 +243,8 @@ function firstLine(command: string): string {
 /** Makes a path clickable in terminals that support OSC 8 links, as Pi does for tool paths. */
 function linked(styled: string, file: FileChange, cwd: string | undefined): string {
   if (!cwd || file.status === "deleted" || !getCapabilities().hyperlinks) return styled;
-  const absolute = isAbsolute(file.path) ? file.path : resolve(cwd, file.path);
+  const absolute = file.path.startsWith("~/") ? join(homedir(), file.path.slice(2))
+    : isAbsolute(file.path) ? file.path : resolve(cwd, file.path);
   return hyperlink(styled, pathToFileURL(absolute).href);
 }
 

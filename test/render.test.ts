@@ -13,7 +13,7 @@ const text = (value: string) => ({ kind: "text" as const, text: value });
 const lines = (n: number) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
 
 function card(raw: RawChange[], extra: Partial<EditCardData> = {}): EditCardData {
-  return { v: 1, commands: ["sed -i s/a/b/ file"], mode: "git", ...describeChanges(raw, "/w"), ...extra };
+  return { v: 1, commands: ["sed -i s/a/b/ file"], ...describeChanges(raw, "/w"), ...extra };
 }
 
 function render(data: EditCardData, expanded: boolean, width = 80): string[] {

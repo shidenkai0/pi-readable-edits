@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { extractTargets, isReadOnly } from "../src/targets.js";
+import { extractTargets } from "../src/targets.js";
+import { fixture } from "./helpers.js";
 
 let root: string;
 before(async () => {
-  root = await mkdtemp(join(tmpdir(), "readable-targets-"));
+  root = await fixture();
   await mkdir(join(root, "course", "lessons"), { recursive: true });
   await writeFile(join(root, "course", "lessons", "01.html"), "old");
   await writeFile(join(root, "course", "lessons", "02.html"), "old");
@@ -226,12 +227,51 @@ for p in glob.glob('course/**/*.html'):
 PY`), []);
 });
 
-test("unknown targets, builds and out-of-project paths keep ordinary shell display", async () => {
+test("unknown targets, builds and scratch paths produce no targets", async () => {
   assert.deepEqual(await targets("python3 build.py"), []);
   assert.deepEqual(await targets("python3 -c 'import os; open(os.environ[\"DEST\"], \"w\").write(\"x\")'"), []);
-  assert.deepEqual(await targets("cat > ../outside.txt <<'EOF'\nx\nEOF"), []);
   assert.deepEqual(await targets("cat > /tmp/outside.txt <<'EOF'\nx\nEOF"), []);
   assert.deepEqual(await targets("cd /tmp && cat > outside.txt <<'EOF'\nx\nEOF"), []);
+  assert.deepEqual(await targets("echo x > .git/config && echo x > node_modules/a/index.js"), []);
+});
+
+test("edits outside the working directory count, with ~ expanded", async () => {
+  assert.deepEqual(await extractTargets("cat > ../sibling/notes.md <<'EOF'\nx\nEOF", join(root, "course")),
+    [join(root, "sibling/notes.md")]);
+  assert.deepEqual(await extractTargets("echo x >> ~/.config/app/settings.ini", root),
+    [join(homedir(), ".config/app/settings.ini")]);
+  assert.deepEqual(await extractTargets("cd ~ && echo x > note.txt", root), [join(homedir(), "note.txt")]);
+  assert.deepEqual(await targets("echo x > '~/literal.txt'"), ["~/literal.txt"]);
+});
+
+test("after cd to an unknown directory, relative paths are unknown too", async () => {
+  assert.deepEqual(await extractTargets('D=$(mktemp -d); cd "$D" && echo x > a.txt; cd /opt/app && echo y > b.txt', root,
+    { directoryExists: () => true }), ["/opt/app/b.txt"]);
+  assert.deepEqual(await targets("echo x > {a,b}.txt"), [], "an ambiguous redirect writes nothing");
+  assert.deepEqual(await extractTargets("cp course/lessons/{01,02}.html course/ && rm -f -- \"$HOME/.cache/stale-x.json\"", root),
+    [join(root, "course/01.html"), join(root, "course/02.html"), join(homedir(), ".cache/stale-x.json")].sort());
+});
+
+test("scripts the command writes and then runs are read like inline code", async () => {
+  assert.deepEqual(await targets(`cat > /tmp/fix.py <<'EOF'
+for p in ['course/a.md', 'course/b.md']:
+    open(p, 'w').write('x')
+EOF
+python3 /tmp/fix.py && rm /tmp/fix.py`), ["course/a.md", "course/b.md"]);
+  assert.deepEqual(await targets("cat <<'EOF' > /tmp/fix.mjs\nimport fs from 'fs'; fs.writeFileSync('c.txt', 'x')\nEOF\nnode /tmp/fix.mjs"),
+    ["c.txt"]);
+  assert.deepEqual(await targets("tee /tmp/run.sh >/dev/null <<'EOF'\necho hi > d.txt\nEOF\nbash /tmp/run.sh"), ["d.txt"]);
+  // A heredoc fed to a script file is its input, not its source; existing scripts stay opaque.
+  assert.deepEqual(await targets("python3 existing.py <<'EOF'\nopen('nope.txt', 'w')\nEOF"), []);
+  assert.deepEqual(await targets("python3 -m black ."), []);
+});
+
+test("a copy changes only its destination", async () => {
+  assert.deepEqual(await targets(`python3 - <<'PY'
+import shutil
+shutil.copy('course/lessons/01.html', 'course/copy.html')
+shutil.move('course/lessons/02.html', 'course/moved.html')
+PY`), ["course/copy.html", "course/lessons/02.html", "course/moved.html"]);
 });
 
 test("heredocs before redirects or pipes still resolve their destinations", async () => {
@@ -249,19 +289,24 @@ test("sed and perl in-place flags work in any position, with bundled or unresolv
   assert.deepEqual(await targets(`sed -i "s/$(date)/x/" course/lessons/02.html`), ["course/lessons/02.html"]);
 });
 
-test("read-only classification skips only commands that provably cannot write", async () => {
-  const readers = [
-    "ls -la", "rg -n foo src | head -20", "git status --short && git diff --stat", "cat a.txt 2>/dev/null || echo missing",
-    "sed -n '1,20p' file.ts", "cd src && grep -rn x .", "git log --oneline -5 2>&1", "echo $(git rev-parse HEAD)",
-    "find . -name '*.ts' -not -path './node_modules/*'", "wc -l < file.txt", "git branch --show-current",
-    "cat <<'EOF'\nhello\nEOF",
-  ];
-  const writers = [
-    "echo hi > out.txt", "sed -i 's/a/b/' f", "find . -delete", "find . -exec rm {} +", "sort -o out.txt in.txt",
-    "git checkout -- f", "git branch new-feature", "xargs rm < list", "cat a | tee b", "python3 script.py", "npm test",
-    "echo $(rm -rf x)", "awk '{print > \"out\"}' f", "git config user.name x", "$EDITOR file", "uniq in out",
-    "cat <<'EOF' > f\nx\nEOF", "ls; touch x",
-  ];
-  for (const command of readers) assert.equal(await isReadOnly(command), true, command);
-  for (const command of writers) assert.equal(await isReadOnly(command), false, command);
+test("Python output helpers, path helpers and a script's own location resolve", async () => {
+  assert.deepEqual(await targets(`python3 - <<'PY'
+from PIL import Image
+import os
+base = os.path.join('course', 'img')
+Image.new('RGB', (1, 1)).save(os.path.join(base, 'a.png'))
+df.to_csv('course/table.csv', index=False)
+fig.savefig(f'{base}/plot.svg')
+model.save()
+PY`), ["course/img/a.png", "course/img/plot.svg", "course/table.csv"]);
+  assert.deepEqual(await targets(`cat > course/make.py <<'PY'
+from pathlib import Path
+(Path(__file__).parent / 'golden.json').write_text('{}')
+PY
+python3 course/make.py`), ["course/golden.json", "course/make.py"]);
+});
+
+test("ln names its link", async () => {
+  assert.deepEqual(await targets("ln -sfn ../shared course/shared-link"), ["course/shared-link"]);
+  assert.deepEqual(await targets("ln -s ../a.txt course/lessons/"), ["course/lessons/a.txt"]);
 });

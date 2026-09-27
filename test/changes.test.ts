@@ -39,13 +39,9 @@ test("secret files keep counts but never their contents", () => {
   assert.equal(isSensitive("/w/environment.ts"), false);
 });
 
-test("unchanged pairs are dropped and mode-only changes are described", () => {
+test("unchanged pairs are dropped", () => {
   const same = text("x\n");
-  const { files } = describe([
-    { path: "/w/same.txt", before: same, after: same },
-    { path: "/w/run.sh", before: same, after: same, oldMode: "100644", newMode: "100755" },
-  ]);
-  assert.deepEqual(files.map((file) => [file.path, file.summary, file.detail]), [["run.sh", "mode", "mode 100644 → 100755"]]);
+  assert.deepEqual(describe([{ path: "/w/same.txt", before: same, after: same }]).files, []);
 });
 
 test("binary changes summarize sizes instead of diffing", () => {
@@ -68,4 +64,14 @@ test("stored diffs are capped per file and per card, with the remainder counted"
   assert.equal(files[0]!.omittedLines, 1400);
   assert.equal(files[4]!.diff, undefined);
   assert.equal(files[4]!.added, 2000, "counts stay accurate even when the diff is not stored");
+});
+
+test("a heavily rewritten large file is summarized quickly instead of diffed", () => {
+  const lines = Array.from({ length: 60_000 }, (_, index) => `line ${index} ${"x".repeat(8)}`);
+  const rewritten = lines.map((line, index) => (index % 3 ? line : `${line} changed`));
+  const started = performance.now();
+  const { files } = describe([{ path: "/w/big.txt", before: text(lines.join("\n")), after: text(rewritten.join("\n")) }]);
+  assert.ok(performance.now() - started < 3000, "bounded well below the old multi-minute worst case");
+  assert.equal(files[0]!.summary, "rewrite");
+  assert.match(files[0]!.detail!, /60000 → 60000 lines/);
 });

@@ -30,11 +30,13 @@
     "typecheck": "tsc --noEmit",
     "preview": "tsx scripts/preview.ts",
     "corpus": "tsx scripts/corpus.ts",
+    "sample": "tsx scripts/sample.ts",
     "eval": "tsx scripts/eval.ts"
   },
   "dependencies": {
-    "fast-glob": "^3.3.3",
     "@vscode/tree-sitter-wasm": "0.3.1",
+    "diff": "^8.0.4",
+    "fast-glob": "^3.3.3",
     "web-tree-sitter": "^0.27.0"
   },
   "peerDependencies": {
@@ -50,11 +52,11 @@
     }
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
     "@earendil-works/pi-coding-agent": "0.87.1",
     "@earendil-works/pi-tui": "0.87.1",
     "@types/node": "^26.0.0",
     "tsx": "^4.20.6",
-    "typescript": "^5.9.3",
-    "@earendil-works/pi-ai": "0.87.1"
+    "typescript": "^5.9.3"
   }
 }

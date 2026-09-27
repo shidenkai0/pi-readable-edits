@@ -1,5 +1,7 @@
+import { homedir } from "node:os";
 import { basename, relative, sep } from "node:path";
 import { generateDiffString } from "@earendil-works/pi-coding-agent";
+import { diffLines } from "diff";
 
 /** One side of a changed path, as captured before or after a command. */
 export type Side =
@@ -7,8 +9,7 @@ export type Side =
   | { kind: "text"; text: string }
   | { kind: "binary"; size: number; hash?: string }
   | { kind: "large"; size: number }
-  | { kind: "link"; target: string }
-  | { kind: "submodule"; commit: string };
+  | { kind: "link"; target: string };
 
 export interface RawChange {
   /** Absolute path after the command. */
@@ -17,9 +18,6 @@ export interface RawChange {
   oldPath?: string;
   before: Side;
   after: Side;
-  oldMode?: string;
-  newMode?: string;
-  generated?: boolean;
 }
 
 export type FileStatus = "added" | "modified" | "deleted" | "renamed";
@@ -35,7 +33,7 @@ export interface FileChange {
   added: number;
   removed: number;
   /** Why the body is summarized instead of shown as a diff. */
-  summary?: "binary" | "large" | "sensitive" | "link" | "submodule" | "eol" | "mode";
+  summary?: "binary" | "large" | "rewrite" | "sensitive" | "link" | "eol";
   /** Presentation hint: lockfiles and generated files collapse even when expanded is off. */
   generated?: boolean;
   detail?: string;
@@ -48,6 +46,12 @@ export const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_FILES = 60;
 const MAX_LINES_PER_FILE = 600;
 const MAX_LINES_PER_CARD = 2400;
+/**
+ * Myers diff is O((N+M)·D): a heavily rewritten large file can take minutes.
+ * Past these bounds the file is summarized as rewritten instead.
+ */
+const MAX_EDIT_LENGTH = 5000;
+const DIFF_TIMEOUT_MS = 400;
 
 const SENSITIVE = [
   /^\.env(\..*)?$/i, /\.(pem|key|p12|pfx|jks|keystore|asc|gpg)$/i, /^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i,
@@ -81,9 +85,13 @@ export function decode(bytes: Buffer): Side {
   }
 }
 
+/** Relative to the session directory when close to it (siblings included), otherwise from `~`. */
 export function displayPath(path: string, cwd: string): string {
   const rel = relative(cwd, path);
-  return (rel || ".").split(sep).join("/");
+  const ups = rel.split(sep).filter((part) => part === "..").length;
+  if (ups <= 1) return (rel || ".").split(sep).join("/");
+  const home = homedir();
+  return (path.startsWith(home + sep) ? `~${path.slice(home.length)}` : path).split(sep).join("/");
 }
 
 function statusOf(change: RawChange): FileStatus {
@@ -153,23 +161,15 @@ function describe(change: RawChange, cwd: string): FileChange | undefined {
     status: statusOf(change),
     added: 0,
     removed: 0,
-    ...(change.generated || isGeneratedName(change.path) ? { generated: true } : {}),
+    ...(isGeneratedName(change.path) ? { generated: true } : {}),
   };
   const { before, after } = change;
-  const modeChanged = !!change.oldMode && !!change.newMode && change.oldMode !== change.newMode &&
-    before.kind !== "absent" && after.kind !== "absent";
-  const modeNote = modeChanged ? `mode ${change.oldMode} → ${change.newMode}` : undefined;
 
   if (before.kind === "link" || after.kind === "link") {
     const from = before.kind === "link" ? before.target : undefined;
     const to = after.kind === "link" ? after.target : undefined;
     if (from === to && !base.oldPath) return undefined;
     return { ...base, summary: "link", detail: from && to ? `symlink ${from} → ${to}` : `symlink → ${to ?? from}` };
-  }
-  if (before.kind === "submodule" || after.kind === "submodule") {
-    const short = (side: Side) => (side.kind === "submodule" ? side.commit.slice(0, 10) : "none");
-    if (short(before) === short(after)) return undefined;
-    return { ...base, summary: "submodule", detail: `submodule ${short(before)} → ${short(after)}` };
   }
 
   const beforeText = text(before), afterText = text(after);
@@ -178,36 +178,34 @@ function describe(change: RawChange, cwd: string): FileChange | undefined {
     return { ...base, summary, detail: [summary === "large" ? "large file" : "binary", describeSizes(before, after)]
       .filter(Boolean).join(" · ") };
   }
-  if (beforeText === afterText) {
-    if (base.oldPath) return base; // Pure rename.
-    return modeNote ? { ...base, summary: "mode", detail: modeNote } : undefined;
-  }
+  if (beforeText === afterText) return base.oldPath ? base : undefined; // A pure rename, or nothing.
   const oldText = lf(beforeText), newText = lf(afterText);
-  if (isSensitive(change.path)) {
-    // Counts only: the session file must not become a copy of a secret.
-    const { added, removed } = oldText === newText ? { added: 0, removed: 0 } : lineStats(oldText, newText);
-    return { ...base, added, removed, summary: "sensitive", detail: "contents hidden" };
-  }
   if (oldText === newText) {
     return { ...base, summary: "eol", detail: beforeText.includes("\r\n") ? "line endings CRLF → LF" : "line endings LF → CRLF" };
   }
   if (before.kind === "absent" && !newText) return { ...base, detail: "empty file" };
-  const { diff } = generateDiffString(oldText, newText, 3);
-  const { added, removed } = countDiff(diff);
-  return { ...base, added, removed, diff, ...(modeNote ? { detail: modeNote } : {}) };
-}
-
-function countDiff(diff: string): { added: number; removed: number } {
-  let added = 0, removed = 0;
-  for (const line of diff.split("\n")) {
-    if (line.startsWith("+")) added++;
-    else if (line.startsWith("-")) removed++;
+  const stats = lineStats(oldText, newText);
+  if (!stats) {
+    const lines = `${countLines(oldText)} → ${countLines(newText)} lines`;
+    return { ...base, summary: "rewrite", detail: `rewritten, too many changes to diff · ${lines}` };
   }
-  return { added, removed };
+  const { added, removed } = stats;
+  // Counts only: the session file must not become a copy of a secret.
+  if (isSensitive(change.path)) return { ...base, added, removed, summary: "sensitive", detail: "contents hidden" };
+  // The bounded pass above guarantees this one finishes in similar time.
+  return { ...base, added, removed, diff: generateDiffString(oldText, newText, 3).diff };
 }
 
-function lineStats(oldText: string, newText: string): { added: number; removed: number } {
+/** Line counts, or undefined when the diff is too expensive to compute. */
+function lineStats(oldText: string, newText: string): { added: number; removed: number } | undefined {
   if (!oldText) return { added: countLines(newText), removed: 0 };
   if (!newText) return { added: 0, removed: countLines(oldText) };
-  return countDiff(generateDiffString(oldText, newText, 0).diff);
+  const parts = diffLines(oldText, newText, { maxEditLength: MAX_EDIT_LENGTH, timeout: DIFF_TIMEOUT_MS });
+  if (!parts) return undefined;
+  let added = 0, removed = 0;
+  for (const part of parts) {
+    if (part.added) added += part.count ?? 0;
+    else if (part.removed) removed += part.count ?? 0;
+  }
+  return { added, removed };
 }

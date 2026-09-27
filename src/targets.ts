@@ -1,7 +1,7 @@
-import { opendirSync, statSync } from "node:fs";
-import { access } from "node:fs/promises";
+import { opendirSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import fg from "fast-glob";
 import { Language, Parser, type Node as SyntaxNode } from "web-tree-sitter";
 
@@ -82,6 +82,16 @@ function shellValue(node: SyntaxNode | null, env: Environment): Value | undefine
     return undefined;
   }
   if (node.type === "number") return text(node.text);
+  if (node.type === "concatenation" || node.type === "word") {
+    // Bash splits `src/{a,b}.ts` into words like `{a` and `,b}`. Expand plain literal lists only.
+    const braced = node.type === "word" ? /\{[^}]*,/.test(node.text)
+      : node.namedChildren.some((child) => child.type === "brace_expression" || (child.type === "word" && /[{}]/.test(child.text)));
+    if (braced) {
+      if (/['"$`\\]/.test(node.text)) return undefined;
+      const words = expandBraces(node.text.replace(/^~(?=\/|$)/, homedir()));
+      return words ? (words.length === 1 ? text(words[0]!) : sequence(words.map(text))) : undefined;
+    }
+  }
   if (node.type === "concatenation") {
     // 'it'"'"'s' and similar quoting tricks: join the parts when each is a single string.
     const parts = node.namedChildren.map((child) => scalar(shellValue(child, env)));
@@ -107,19 +117,22 @@ function shellValue(node: SyntaxNode | null, env: Environment): Value | undefine
   const tail = node.text.slice(offset, end);
   if (/[`$]/.test(tail)) return undefined;
   pieces = pieces.map((part) => (part + tail).replace(/\\(["\\$`])/g, "$1").replace(/\\\n/g, ""));
+  // Tilde expansion applies to unquoted words only.
+  if (node.type === "word" && /^~(?:\/|$)/.test(node.text)) pieces = pieces.map((part) => homedir() + part.slice(1));
   return pieces.length === 1 ? text(pieces[0]) : sequence(pieces.map(text));
 }
 
 function expand(pattern: string, cwd: string): string[] {
   if (!/[*?[\]]/.test(pattern)) return [pattern];
-  if (isAbsolute(pattern)) return [];
-  const directory = dirname(pattern);
-  // A literal parent keeps glob work finite. Recursive or wildcard-directory
-  // scans are intentionally left to ordinary Bash output.
-  if (/[*?[\]{}]/.test(directory)) return [];
+  // Recursive globs are unbounded; so are wildcards directly under / or ~.
+  if (pattern.includes("**")) return [];
+  const parts = pattern.split("/");
+  const literal = parts.slice(0, parts.findIndex((part) => /[*?[\]{}]/.test(part))).join("/");
+  const base = resolve(cwd, literal || ".");
+  if (base === "/" || base === homedir()) return [];
   let entries;
   try {
-    entries = opendirSync(resolve(cwd, directory));
+    entries = opendirSync(base);
     let count = 0;
     while (entries.readSync()) if (++count > MAX_GLOB_ENTRIES) return [];
   } catch {
@@ -128,9 +141,31 @@ function expand(pattern: string, cwd: string): string[] {
     try { entries?.closeSync(); } catch { /* already closed at EOF */ }
   }
   return fg.sync(pattern, {
-    cwd, dot: true, onlyFiles: true, followSymbolicLinks: false,
-    ignore: ["**/.git/**", "**/node_modules/**", "**/.local/**"],
+    cwd, dot: true, onlyFiles: true, followSymbolicLinks: false, deep: parts.length,
+    ignore: ["**/.git/**", "**/node_modules/**"],
   }).slice(0, MAX_TARGETS);
+}
+
+/** Expands `{a,b}` lists in a literal word, as Bash does before anything else. */
+function expandBraces(word: string): string[] | undefined {
+  const open = word.indexOf("{");
+  if (open < 0) return [word];
+  let depth = 0, close = -1;
+  const commas: number[] = [];
+  for (let i = open; i < word.length && close < 0; i++) {
+    if (word[i] === "{") depth++;
+    else if (word[i] === "}" && --depth === 0) close = i;
+    else if (word[i] === "," && depth === 1) commas.push(i);
+  }
+  if (close < 0 || !commas.length) return undefined; // Sequences like {1..3} and stray braces are not modeled.
+  const options = [open, ...commas].map((start, index) => word.slice(start + 1, [...commas, close][index]));
+  const results: string[] = [];
+  for (const option of options) {
+    const expanded = expandBraces(word.slice(0, open) + option + word.slice(close + 1));
+    if (!expanded || results.length + expanded.length > MAX_TARGETS) return undefined;
+    results.push(...expanded);
+  }
+  return results;
 }
 
 function argsOf(node: SyntaxNode): SyntaxNode[] {
@@ -185,10 +220,30 @@ function evalPython(node: SyntaxNode | null, env: Environment, cwd: string, dept
     return operator && a !== undefined && b !== undefined
       ? text(operator === "/" ? (isAbsolute(b) ? b : `${a.replace(/\/$/, "")}/${b}`) : a + b) : undefined;
   }
+  if (node.type === "attribute" && field(node, "attribute")?.text === "parent") {
+    const base = scalar(evaluate(field(node, "object")));
+    return base === undefined ? undefined : text(dirname(base));
+  }
   if (node.type === "call") {
     const fn = field(node, "function")?.text;
     const params = field(node, "arguments")?.namedChildren ?? [];
     if (fn === "Path" || fn === "pathlib.Path" || fn === "str") return evaluate(params[0]);
+    if (fn === "Path.home" || fn === "pathlib.Path.home") return text(homedir());
+    if (fn === "Path.cwd" || fn === "pathlib.Path.cwd" || fn === "os.getcwd") return text(cwd);
+    if (fn === "os.path.join" || fn === "os.path.dirname" || fn === "os.path.abspath" || fn === "os.path.realpath" ||
+        fn === "os.path.normpath" || fn === "os.path.expanduser") {
+      const parts = params.map((param) => scalar(evaluate(param)));
+      if (!parts.length || parts.some((part) => part === undefined)) return undefined;
+      const [first, ...rest] = parts as string[];
+      if (fn === "os.path.join") return text(rest.reduce((joined, part) => (isAbsolute(part) ? part : `${joined.replace(/\/$/, "")}/${part}`), first));
+      if (fn === "os.path.dirname") return text(dirname(first));
+      if (fn === "os.path.expanduser") return text(first.replace(/^~(?=\/|$)/, homedir()));
+      return text(resolve(cwd, first));
+    }
+    if (fn?.endsWith(".expanduser")) {
+      const base = scalar(evaluate(field(field(node, "function")!, "object")));
+      return base === undefined ? undefined : text(base.replace(/^~(?=\/|$)/, homedir()));
+    }
     if (fn === "glob.glob" || fn === "glob.iglob") {
       const pattern = scalar(evaluate(params[0]));
       return pattern === undefined ? undefined : sequence(expand(pattern, cwd).map(text));
@@ -223,10 +278,16 @@ function bind(pattern: SyntaxNode, value: Value, env: Environment): boolean {
   return false;
 }
 
-function inspectPython(source: string, cwd: string, add: (path: string, cwd: string) => void, parser: Parser): void {
+/** Methods whose first argument is a file they write. */
+const SAVE_METHODS = new Set(["save", "savefig", "savetxt", "savez", "savez_compressed", "to_csv", "to_json", "to_parquet",
+  "to_excel", "to_pickle", "to_html", "to_feather"]);
+
+function inspectPython(source: string, cwd: string, add: (path: string, cwd: string) => void, parser: Parser,
+  script?: string): void {
   const root = parser.parse(source)?.rootNode;
   if (!root || root.hasError) return;
-  const env: Environment = new Map();
+  // A script file knows where it lives; `Path(__file__).parent / "out.json"` is a common idiom.
+  const env: Environment = new Map(script ? [["__file__", text(script)]] : []);
   const helpers = new Map<string, SyntaxNode>();
   let visits = 0;
   function visit(node: SyntaxNode, values: Environment, depth = 0): void {
@@ -294,12 +355,17 @@ function inspectPython(source: string, cwd: string, add: (path: string, cwd: str
         const receiver = field(fn, "object");
         if (method === "write_text" || method === "write_bytes" || method === "touch" || method === "unlink" || method === "mkdir") {
           paths = strings(evalPython(receiver, values, cwd));
+        } else if (method && SAVE_METHODS.has(method) && params[0]?.type !== "keyword_argument") {
+          // Images, figures and data frames written to a path: img.save('a.png'), df.to_csv(path).
+          paths = strings(evalPython(params[0] ?? null, values, cwd));
         } else if (method === "open" && /[wax+]/.test(scalar(evalPython(params[0], values, cwd)) ?? "")) {
           paths = strings(evalPython(receiver, values, cwd));
         }
       }
       if (name && /^(?:os\.rename|os\.replace|shutil\.(?:copy|copy2|copyfile|move))$/.test(name)) {
-        paths = [...(strings(evalPython(params[0], values, cwd)) ?? []), ...(strings(evalPython(params[1], values, cwd)) ?? [])];
+        // A copy changes only its destination; a move also removes its source.
+        const moved = /rename|replace|move/.test(name) ? strings(evalPython(params[0], values, cwd)) ?? [] : [];
+        paths = [...moved, ...(strings(evalPython(params[1], values, cwd)) ?? [])];
       }
       paths?.forEach((path) => add(path, cwd));
     }
@@ -355,31 +421,58 @@ function inspectJavaScript(source: string, cwd: string, add: (path: string, cwd:
   visit(root);
 }
 
-/** Prefer the enclosing Git worktree, so a command started in a subdirectory can still edit siblings. */
-export async function scopeRoot(cwd: string): Promise<string> {
-  let dir = resolve(cwd);
-  while (true) {
-    try { await access(join(dir, ".git")); return dir; } catch { /* try ancestor */ }
-    const parent = dirname(dir);
-    if (parent === dir) return resolve(cwd);
-    dir = parent;
-  }
+/** Where agents put throwaway files. Writes there are scratch work, not edits worth a card. */
+const SCRATCH = [...new Set([tmpdir(), "/tmp", "/var/tmp", "/var/folders", "/dev", "/proc", "/sys"].flatMap((dir) => {
+  try { return [dir, realpathSync(dir)]; } catch { return [dir]; }
+}))];
+
+const within = (path: string, dir: string) => path === dir || path.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+
+export function isScratch(path: string): boolean {
+  return SCRATCH.some((dir) => within(path, dir));
 }
 
-/** Returns only confidently resolved, project-local targets. No command is executed. */
-export async function extractTargets(command: string, cwd: string, projectRoot = cwd): Promise<string[]> {
+
+/**
+ * Paths never worth a card: Git internals, installed dependencies, logs, and
+ * scratch files, unless the session itself works in that temp directory.
+ */
+export function isIgnored(path: string, cwd?: string): boolean {
+  if (path.endsWith(".log") || path.split(sep).some((part) => part === ".git" || part === "node_modules")) return true;
+  return isScratch(path) && !(cwd !== undefined && isScratch(cwd) && within(path, cwd));
+}
+
+export interface TargetOptions {
+  /** Whether `cd` can enter a directory. Defaults to asking the filesystem. */
+  directoryExists?: (path: string) => boolean;
+  /** Paths never worth a card. Defaults to `isIgnored` relative to `cwd`. */
+  ignored?: (path: string) => boolean;
+}
+
+/** A working directory after `cd` to something unresolvable: relative paths there are unknown. */
+const UNKNOWN_CWD = "\0unknown";
+
+const isDirectory = (path: string) => {
+  try { return statSync(path).isDirectory(); } catch { return false; }
+};
+
+/** Returns only confidently resolved targets, as absolute paths. No command is executed. */
+export async function extractTargets(command: string, cwd: string, options: TargetOptions = {}): Promise<string[]> {
   if (Buffer.byteLength(command) > MAX_COMMAND_BYTES) return [];
   const { bash, python, javascript } = await getParsers();
   const root = bash.parse(command)?.rootNode;
   if (!root || root.hasError) return [];
-  const rootPath = resolve(projectRoot);
+  const directoryExists = options.directoryExists ?? isDirectory;
+  const ignored = options.ignored ?? ((path: string) => isIgnored(path, resolve(cwd)));
   const found = new Set<string>();
+  // Scripts this command writes from heredocs (`cat > /tmp/fix.py <<EOF`), by absolute path,
+  // so a later `python3 /tmp/fix.py` in the same command can be read like inline code.
+  const scripts = new Map<string, string>();
   function add(path: string, cwd: string): void {
     if (!path || path.includes("\0") || found.size >= MAX_TARGETS) return;
+    if (cwd === UNKNOWN_CWD && !isAbsolute(path)) return;
     const absolute = resolve(cwd, path);
-    const relativePath = relative(rootPath, absolute);
-    if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) return;
-    if (relativePath.split(sep).some((part) => part === ".git" || part === "node_modules" || part === ".local")) return;
+    if (ignored(absolute)) return;
     found.add(absolute);
   }
 
@@ -456,9 +549,14 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
           // `2>&1` and `>&-` duplicate or close descriptors; they name no file.
           if (/^\d*>&/.test(child.text.trim()) && (dest?.type === "number" || dest?.text === "-")) continue;
           const paths = strings(shellValue(dest, env));
-          if (paths && /^(\d*)?(?:>|>>|>\||&>|&>>)/.test(child.text.trim())) {
+          // A redirect to several words (`> {a,b}.txt`) is an "ambiguous redirect" error in Bash.
+          if (paths?.length === 1 && /^(\d*)?(?:>|>>|>\||&>|&>>)/.test(child.text.trim())) {
             paths.forEach((path) => (dest?.type === "word" ? expand(path, redirectCwd) : [path])
               .forEach((candidate) => add(candidate, redirectCwd)));
+            if (content !== undefined && paths.length === 1 && /^>\|?\s*[^>]/.test(child.text.trim()) &&
+                body?.type === "command" && scalar(shellValue(field(body, "name"), env)) === "cat") {
+              scripts.set(resolve(redirectCwd, paths[0]), content);
+            }
           }
         }
       }
@@ -491,14 +589,17 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
     }
     if (node.type === "command") {
       const name = scalar(shellValue(field(node, "name"), env));
-      const args = argsOf(node).map((arg) => scalar(shellValue(arg, env)));
+      // Words that expand to several (brace lists, "${array[@]}") become several arguments, as in Bash.
+      const args = argsOf(node).flatMap((arg): Array<string | undefined> => strings(shellValue(arg, env)) ?? [undefined]);
       if (name === "cd") {
-        if (args.length === 1 && args[0]) {
-          const directory = resolve(cwd, args[0]);
-          try { if (statSync(directory).isDirectory()) return directory; } catch { /* not present yet */ }
-          if (createdDirectories.has(directory)) return directory;
-        }
-        return cwd;
+        const operands = argsOf(node).filter((arg) => arg.text !== "--");
+        if (operands.length === 0) return homedir();
+        const target = operands.length === 1 ? scalar(shellValue(operands[0]!, env)) : undefined;
+        if (target === undefined || target === "-") return UNKNOWN_CWD;
+        if (cwd === UNKNOWN_CWD && !isAbsolute(target)) return UNKNOWN_CWD;
+        const directory = resolve(cwd, target);
+        // A failed cd leaves the shell where it was.
+        return directoryExists(directory) || createdDirectories.has(directory) ? directory : cwd;
       }
       if (!name) return cwd;
       const executable = name.split("/").pop()!;
@@ -514,18 +615,35 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
           }
         }
       }
-      if (/^python(?:\d+(?:\.\d+)?)?$/.test(executable)) {
-        const index = args.findIndex((arg) => arg === "-c");
-        const source = index >= 0 ? args[index + 1] : heredoc;
-        if (source) inspectPython(source, cwd, add, python);
+      // The program is inline (-c/-e), a script this command wrote, or read from stdin.
+      const program = (inline: string[]): { source?: string; path?: string } => {
+        const index = args.findIndex((arg) => arg !== undefined && inline.includes(arg));
+        if (index >= 0) return { source: args[index + 1] };
+        const script = args.find((arg) => arg === undefined || !arg.startsWith("-"));
+        if (script === undefined && args.some((arg) => arg === undefined)) return {};
+        if (!script || script === "-") return { source: heredoc };
+        const path = resolve(cwd, script);
+        return { source: scripts.get(path), path };
+      };
+      if (/^python(?:\d+(?:\.\d+)?)?$/.test(executable) && !args.includes("-m")) {
+        const { source, path } = program(["-c"]);
+        if (source) inspectPython(source, cwd, add, python, path);
       }
       if (executable === "node" || executable === "nodejs") {
-        const index = args.findIndex((arg) => arg === "-e" || arg === "--eval");
-        const source = index >= 0 ? args[index + 1] : heredoc;
+        const { source } = program(["-e", "--eval"]);
         if (source) inspectJavaScript(source, cwd, add, javascript);
       }
+      if ((executable === "bash" || executable === "sh" || executable === "zsh") && !args.includes("-c")) {
+        const { source } = program([]);
+        const script = source === undefined ? undefined : bash.parse(source)?.rootNode;
+        if (script && !script.hasError) visit(script, cwd, new Map(), undefined, depth + 1, createdDirectories);
+      }
       if (executable === "tee") {
-        args.filter((arg) => arg && !arg.startsWith("-")).forEach((arg) => add(arg!, cwd));
+        for (const arg of args) {
+          if (!arg || arg.startsWith("-")) continue;
+          add(arg, cwd);
+          if (heredoc !== undefined && !args.includes("-a")) scripts.set(resolve(cwd, arg), heredoc);
+        }
       }
       if (executable === "sed" && args.some((arg) => arg === "-i" || /^-[a-zA-Z]*i/.test(arg ?? "") || arg?.startsWith("--in-place"))) {
         let hasProgram = args.some((arg) => arg === "-e" || arg === "--expression" || arg === "-f" || arg === "--file" ||
@@ -569,6 +687,12 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
       if (executable === "rm" && !args.some((arg) => arg === "--recursive" || /^-[a-z]*[rR]/.test(arg ?? ""))) {
         operands.forEach((operand) => expand(operand, cwd).forEach((path) => add(path, cwd)));
       }
+      if (executable === "ln" && operands.length >= 2 && !args.some((arg) => arg === "-t" || arg?.startsWith("--target-directory"))) {
+        const destination = operands[operands.length - 1]!;
+        const noDereference = args.some((arg) => arg === "-n" || arg === "-T" || /^-[a-zA-Z]*[nT]/.test(arg ?? ""));
+        const directory = destination.endsWith("/") || operands.length > 2 || (!noDereference && isDirectory(resolve(cwd, destination)));
+        for (const source of operands.slice(0, -1)) add(directory ? join(destination, basename(source)) : destination, cwd);
+      }
       const unsupportedLayout = args.some((arg) => arg === "-t" || arg === "--target-directory" ||
         arg?.startsWith("--target-directory=") || (executable === "cp" && (arg === "--recursive" || /^-[a-zA-Z]*[rR]/.test(arg ?? ""))));
       if ((executable === "cp" || moving) && !unsupportedLayout && operands.length >= 2) {
@@ -588,82 +712,18 @@ export async function extractTargets(command: string, cwd: string, projectRoot =
     for (const child of node.namedChildren) cwd = visit(child, cwd, env, heredoc, depth, createdDirectories);
     return cwd;
   }
-  visit(root, resolve(cwd), new Map());
+  visit(root, resolve(cwd), new Map([["HOME", text(homedir())]]));
   return [...found].sort();
 }
 
-/** Programs that never write files, given the argument checks in `readOnlyInvocation`. */
-const READ_ONLY_PROGRAMS = new Set([
-  "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "ag", "fd", "tree", "pwd", "echo", "printf",
-  "which", "type", "command", "file", "stat", "du", "df", "jq", "cut", "tr", "diff", "cmp", "basename", "dirname",
-  "realpath", "readlink", "date", "true", "false", "test", "[", "sleep", "nl", "column", "od", "hexdump", "md5",
-  "md5sum", "shasum", "sha256sum", "ps", "whoami", "uname", "id", "hostname", "nproc", "cd", "less", "more", "bat",
-  "sed", "awk", "sort", "find", "git", "uniq",
-]);
-const READ_ONLY_GIT = new Set([
-  "status", "log", "diff", "show", "rev-parse", "ls-files", "ls-tree", "blame", "describe", "shortlog", "grep",
-  "cat-file", "rev-list", "merge-base", "branch", "remote", "config", "reflog", "name-rev", "for-each-ref",
-]);
-
-function readOnlyInvocation(name: string, args: Array<string | undefined>): boolean {
-  if (!READ_ONLY_PROGRAMS.has(name)) return false;
-  const has = (pattern: RegExp) => args.some((arg) => arg === undefined || pattern.test(arg));
-  switch (name) {
-    case "sed": return !has(/^-[a-zA-Z]*i|^--in-place/) && !has(/^-[a-zA-Z]*[wW]/) && !args.some((arg) => arg && /(^|;|\s)w\s/.test(arg));
-    case "awk": return !has(/^-i|inplace/) && !args.some((arg) => arg && />|system|print\s*>/.test(arg));
-    case "sort": return !has(/^-[a-zA-Z]*o|^--output/);
-    case "uniq": return args.filter((arg) => arg && !arg.startsWith("-")).length <= 1;
-    case "find": return !has(/^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/);
-    case "git": {
-      const sub = args.find((arg) => arg && !arg.startsWith("-"));
-      if (!sub || !READ_ONLY_GIT.has(sub)) return false;
-      if (sub === "branch" || sub === "remote" || sub === "config") {
-        // Listing forms only; these subcommands also have writing forms.
-        return args.slice(args.indexOf(sub) + 1).every((arg) => arg !== undefined && /^(-[alrv]+|--(list|all|show-current|get\S*|verbose))$/.test(arg));
-      }
-      return !has(/^--output/);
-    }
-    default: return true;
-  }
+/** Parses a shell command for tooling that classifies commands (see scripts/readonly.ts). */
+export async function parseShell(command: string): Promise<SyntaxNode | undefined> {
+  if (Buffer.byteLength(command) > MAX_COMMAND_BYTES) return undefined;
+  const root = (await getParsers()).bash.parse(command)?.rootNode;
+  return root && !root.hasError ? root : undefined;
 }
 
-/**
- * True when the command provably cannot change project files: every program
- * is a known reader, and every redirect is an input, a descriptor duplicate,
- * or /dev/null. Anything unrecognized counts as writing.
- */
-export async function isReadOnly(command: string): Promise<boolean> {
-  if (Buffer.byteLength(command) > MAX_COMMAND_BYTES) return false;
-  const { bash } = await getParsers();
-  const root = bash.parse(command)?.rootNode;
-  if (!root || root.hasError) return false;
-  let visits = 0;
-  const safe = (node: SyntaxNode): boolean => {
-    if (++visits > MAX_VISITS) return false;
-    switch (node.type) {
-      case "program": case "list": case "pipeline": case "subshell": case "compound_statement": case "negated_command":
-      case "redirected_statement": case "command_substitution": case "string": case "concatenation": case "word":
-      case "raw_string": case "string_content": case "simple_expansion": case "expansion": case "variable_name":
-      case "number": case "comment": case "heredoc_redirect": case "heredoc_start": case "heredoc_body": case "heredoc_end":
-      case "herestring_redirect": case "ansi_c_string": case "special_variable_name": case "command_name":
-        return node.namedChildren.every(safe);
-      case "file_redirect": {
-        const operator = node.text.trim().replace(/^\d+/, "");
-        if (operator.startsWith("<")) return true;
-        if (/^>&\d*-?$|^>&\s*\d+$/.test(operator)) return true;
-        return field(node, "destination")?.text === "/dev/null";
-      }
-      case "command": {
-        const nameNode = field(node, "name");
-        if (!nameNode || nameNode.namedChildren[0]?.type !== "word") return false;
-        const name = nameNode.text.split("/").pop()!;
-        const argNodes = argsOf(node);
-        const args = argNodes.map((arg) => scalar(shellValue(arg, new Map())));
-        return readOnlyInvocation(name, args) && argNodes.every(safe);
-      }
-      default:
-        return false;
-    }
-  };
-  return safe(root);
+/** The literal value of a shell word, when it has one without variables. */
+export function literalWord(node: SyntaxNode): string | undefined {
+  return scalar(shellValue(node, new Map()));
 }

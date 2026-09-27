@@ -12,7 +12,7 @@ tasks:
       - pnpm install
 
   test:
-    desc: Run Git engine, parser, tracker, rendering and extension tests
+    desc: Run parser, capture, tracker, rendering and extension tests
     cmds:
       - pnpm test
 
@@ -48,17 +48,16 @@ tasks:
       - cp .scratch/readme.png docs/card.png
 
   corpus:
-    desc: Stream recent Bash calls into the private local corpus
+    desc: Stream Bash calls from local Claude Code, Codex and Pi transcripts into the private corpus
     cmds:
       - pnpm corpus
 
-  eval:
-    desc: Refresh the corpus and score the fallback parser against local labels
+  eval:sample:
+    desc: Draw a stratified per-model labeling sample from the corpus into .local/eval (then label it; see scripts/eval-rubric.md)
     cmds:
-      - task: corpus
-      - pnpm eval
+      - pnpm sample
 
-  eval:frozen:
-    desc: Score the fallback parser against the frozen, fully labeled private corpus
+  eval:
+    desc: Score the parser against the private labeled sample, per model family and overall
     cmds:
-      - pnpm eval .local/luna-corpus.jsonl .local/labeling/all-labels.json
+      - pnpm eval

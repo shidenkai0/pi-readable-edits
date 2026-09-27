@@ -1,84 +1,36 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, readlink, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { decode, MAX_TEXT_BYTES, type RawChange, type Side } from "./changes.js";
-import { type BlobContent, EMPTY_OID, type GitSnapshots } from "./git.js";
-import { extractTargets } from "./targets.js";
-
-/** A capture opened before one or more overlapping commands and closed after the last one. */
-export interface Capture {
-  readonly mode: "git" | "targeted";
-  /** Adds a command that joined the capture while it was open. */
-  include(command: string, cwd: string): Promise<void>;
-  finish(): Promise<RawChange[]>;
-}
-
-export class GitCapture implements Capture {
-  readonly mode = "git";
-
-  constructor(
-    private readonly snapshots: GitSnapshots,
-    private readonly before: string,
-    private readonly takeSnapshot: () => Promise<string>,
-  ) {}
-
-  async include(): Promise<void> {
-    // The whole worktree is already covered.
-  }
-
-  async finish(): Promise<RawChange[]> {
-    const after = await this.takeSnapshot();
-    const entries = await this.snapshots.diff(this.before, after);
-    if (!entries.length) return [];
-    const blobs = await this.snapshots.readBlobs(
-      entries.flatMap((entry) => [entry.oldOid, entry.newOid]), MAX_TEXT_BYTES);
-    const generated = await this.snapshots.generatedPaths(entries.map((entry) => entry.path));
-    const root = this.snapshots.root;
-    return entries.map((entry) => ({
-      path: join(root, entry.path),
-      ...(entry.oldPath ? { oldPath: join(root, entry.oldPath) } : {}),
-      before: sideOf(entry.oldMode, entry.oldOid, blobs),
-      after: sideOf(entry.newMode, entry.newOid, blobs),
-      oldMode: entry.oldMode,
-      newMode: entry.newMode,
-      ...(generated.has(entry.path) ? { generated: true } : {}),
-    }));
-  }
-}
-
-function sideOf(mode: string, oid: string, blobs: Map<string, BlobContent>): Side {
-  if (EMPTY_OID.test(oid) || mode === "000000") return { kind: "absent" };
-  if (mode === "160000") return { kind: "submodule", commit: oid };
-  const blob = blobs.get(oid);
-  if (!blob || blob.kind === "missing") return { kind: "binary", size: 0 };
-  if (blob.kind === "large") return { kind: "large", size: blob.size };
-  if (mode === "120000") return { kind: "link", target: blob.bytes.toString() };
-  return decode(blob.bytes);
-}
+import { extractTargets, isIgnored } from "./targets.js";
 
 /**
- * Fallback outside Git (or where Git snapshots are too slow): statically
- * resolve the files a command names, then compare their real contents.
+ * Records the files one or more overlapping commands name, before they run,
+ * and compares them after the last one finishes.
+ *
+ * Targets come from statically parsing each command, so only deliberate
+ * edits appear: a formatter or build that rewrites files is not an edit the
+ * model wrote, and stays out of the card.
  */
-export class TargetedCapture implements Capture {
-  readonly mode = "targeted";
+export class FileCapture {
   private readonly snapshots = new Map<string, Side>();
 
-  private constructor(private readonly root: string, private readonly canonicalRoot: string) {}
-
-  static async open(root: string): Promise<TargetedCapture> {
-    return new TargetedCapture(root, await realpath(root));
+  static async start(command: string, cwd: string): Promise<FileCapture> {
+    const capture = new FileCapture();
+    await capture.include(command, cwd);
+    return capture;
   }
 
+  /** Adds a command that joined the capture while it was open. */
   async include(command: string, cwd: string): Promise<void> {
     let targets: string[] = [];
     try {
-      targets = await extractTargets(command, cwd, this.root);
+      targets = await extractTargets(command, cwd);
     } catch {
       return;
     }
     for (const path of targets) {
-      if (this.snapshots.has(path) || !(await insideRoot(path, this.canonicalRoot))) continue;
+      if (this.snapshots.has(path) || !(await watched(path, cwd))) continue;
       const side = await readSide(path);
       if (side) this.snapshots.set(path, side);
     }
@@ -87,7 +39,6 @@ export class TargetedCapture implements Capture {
   async finish(): Promise<RawChange[]> {
     const changes: RawChange[] = [];
     for (const [path, before] of this.snapshots) {
-      if (!(await insideRoot(path, this.canonicalRoot))) continue;
       const after = await readSide(path);
       if (!after || same(before, after)) continue;
       changes.push({ path, before, after });
@@ -136,12 +87,12 @@ async function readSide(path: string): Promise<Side | undefined> {
   }
 }
 
-async function insideRoot(path: string, root: string): Promise<boolean> {
+/** Resolves symlinked parents, so a path that leads into a temp directory still counts as scratch. */
+async function watched(path: string, cwd: string): Promise<boolean> {
   let parent = dirname(path);
   while (true) {
     try {
-      const rel = relative(root, await realpath(parent));
-      return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+      return !isIgnored(join(await realpath(parent), basename(path)), await realpath(cwd).catch(() => cwd));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === dirname(parent)) return false;
       parent = dirname(parent);

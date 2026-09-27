@@ -58,7 +58,6 @@ test("a bash edit becomes a card appended after the turn's tool results, chained
   const card = result.entries[1].data as EditCardData;
   assert.equal(result.entries[1].customType, "readable-edits");
   assert.deepEqual(card.files.map((file) => [file.path, file.added, file.removed]), [["src/app.ts", 1, 1]]);
-  assert.equal(card.mode, "git");
 
   const lines = plain(pi.render()({ data: card }, { expanded: false }, theme).render(90));
   assert.ok(lines.some((line) => line.startsWith("✎ Edited src/app.ts  +1 −1")));
@@ -66,15 +65,20 @@ test("a bash edit becomes a card appended after the turn's tool results, chained
   assert.equal(await pi.emit("turn_end", { entries: [] }, ctx), undefined, "cards are delivered once");
 });
 
-test("read-only commands are not snapshotted, and print mode is never observed", async () => {
+test("only edits written in the command show; programs that rewrite files on their own do not", async () => {
+  const root = await repository({ "a.txt": "a\n", "fmt.py": "open('a.txt', 'w').write('formatted\\n')\n" });
+  roots.push(root);
+  const pi = load();
+  await bash(pi, context(root), "read", "cat a.txt && git status --short");
+  await bash(pi, context(root), "format", "python3 fmt.py");
+  assert.equal(await pi.emit("turn_end", { entries: [] }, context(root)), undefined);
+  assert.equal(sh("cat a.txt", root), "formatted\n");
+});
+
+test("print mode is never observed", async () => {
   const root = await repository({ "a.txt": "a\n" });
   roots.push(root);
   const pi = load();
-  const notices: string[] = [];
-  await bash(pi, context(root), "read", "cat a.txt && git status --short");
-  assert.equal(await pi.emit("turn_end", { entries: [] }, context(root)), undefined);
-  await pi.command()("status", context(root, notices));
-  assert.match(notices[0]!, /No shell commands observed yet/);
   const print = context(root, [], "print");
   await bash(pi, print, "print", "echo b > a.txt");
   assert.equal(await pi.emit("turn_end", { entries: [] }, print), undefined);
@@ -88,7 +92,6 @@ test("outside Git, files the command names are still diffed", async () => {
   await bash(pi, ctx, "c", "cat <<'EOF' > notes.md\nThe plan\nEOF");
   const result = await pi.emit("turn_end", { entries: [] }, ctx) as { entries: any[] };
   const card = result.entries[0].data as EditCardData;
-  assert.equal(card.mode, "targeted");
   assert.deepEqual(card.files.map((file) => file.path), ["notes.md"]);
 });
 
@@ -104,7 +107,7 @@ test("a run that ends without turn_end still records its card", async () => {
   assert.equal(pi.appended[0]!.customType, "readable-edits");
 });
 
-test("the command toggles observation and reports how each repository is watched", async () => {
+test("the command toggles observation", async () => {
   const root = await repository({ "a.txt": "a\n" });
   roots.push(root);
   const pi = load();
@@ -115,6 +118,6 @@ test("the command toggles observation and reports how each repository is watched
   assert.equal(await pi.emit("turn_end", { entries: [] }, ctx), undefined);
   await pi.command()("on", ctx);
   await bash(pi, ctx, "2", "echo c > a.txt");
-  await pi.command()("", ctx);
-  assert.match(notices.at(-1)!, /Readable edits: on\n.*: Git snapshots, 2 taken, \d+ms average/);
+  assert.equal(((await pi.emit("turn_end", { entries: [] }, ctx)) as { entries: unknown[] }).entries.length, 1);
+  assert.deepEqual(notices, ["Readable edits off", "Readable edits on"]);
 });

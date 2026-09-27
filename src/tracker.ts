@@ -1,8 +1,14 @@
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import type { Capture } from "./capture.js";
-import { describeChanges, displayPath } from "./changes.js";
+import { FileCapture } from "./capture.js";
+import { describeChanges, displayPath, type RawChange } from "./changes.js";
 import type { EditCardData } from "./render.js";
+
+export interface Capture {
+  /** Adds a command that joined the capture while it was open. */
+  include(command: string, cwd: string): Promise<void>;
+  finish(): Promise<RawChange[]>;
+}
 
 export interface CaptureSource {
   start(command: string, cwd: string): Promise<Capture>;
@@ -37,11 +43,16 @@ export class EditTracker {
   private group?: Group;
   private readonly editsInFlight = new Map<string, string>();
 
+  private readonly source: CaptureSource;
+  private readonly onError: (error: unknown) => void;
+
   constructor(
-    private readonly source: CaptureSource,
     private readonly onCard: (card: EditCardData) => void,
-    private readonly onError: (error: unknown) => void = () => {},
-  ) {}
+    options: { source?: CaptureSource; onError?: (error: unknown) => void } = {},
+  ) {
+    this.source = options.source ?? FileCapture;
+    this.onError = options.onError ?? (() => {});
+  }
 
   /** Call before a shell command executes; resolves once its "before" state is recorded. */
   async shellStarting(id: string, command: string, directory: string): Promise<void> {
@@ -119,7 +130,6 @@ export class EditTracker {
         ...(omittedFiles ? { omittedFiles } : {}),
         ...(elsewhere.length ? { shownElsewhere: elsewhere.map((change) => displayPath(change.path, group.cwd)) } : {}),
         ...(members.some((member) => member.failed) ? { failed: true } : {}),
-        mode: capture.mode,
         cwd: group.cwd,
       });
     } catch (error) {
@@ -136,7 +146,7 @@ export function summarizeCommand(command: string): string {
   return first.length > 240 ? `${first.slice(0, 239)}…` : first;
 }
 
-/** Git reports canonical paths; a symlinked working directory (macOS /var, ~/src links) must match them. */
+/** Targets are compared by canonical path; a symlinked working directory (macOS /var, ~/src links) must match them. */
 function canonical(directory: string): string {
   try {
     return realpathSync(directory);

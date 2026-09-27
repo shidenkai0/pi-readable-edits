@@ -37,7 +37,7 @@ export function stop(server) {
 
 function card(title: string, raw: RawChange[], extra: Partial<EditCardData> & { commands: string[] }) {
   const { files, omittedFiles } = describeChanges(raw, cwd);
-  return { title, data: { v: 1 as const, files, mode: "git" as const, ...(omittedFiles ? { omittedFiles } : {}), ...extra } };
+  return { title, data: { v: 1 as const, files, ...(omittedFiles ? { omittedFiles } : {}), ...extra } };
 }
 
 const lines = (n: number, label: string) => Array.from({ length: n }, (_, i) => `${label} line ${i + 1}`).join("\n") + "\n";

@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Capture } from "../src/capture.js";
 import type { RawChange } from "../src/changes.js";
 import type { EditCardData } from "../src/render.js";
-import { EditTracker, summarizeCommand } from "../src/tracker.js";
+import { type Capture, EditTracker, summarizeCommand } from "../src/tracker.js";
 
 /** A fake capture source: each capture reports whatever the test queued while it was open. */
 function harness() {
@@ -14,13 +13,12 @@ function harness() {
     async start(command: string): Promise<Capture> {
       log.push(`start ${command}`);
       return {
-        mode: "git" as const,
         async include(joined: string) { log.push(`include ${joined}`); },
         async finish() { log.push("finish"); const result = changes; changes = []; return result; },
       };
     },
   };
-  const tracker = new EditTracker(source, (card) => cards.push(card));
+  const tracker = new EditTracker((card) => cards.push(card), { source });
   const edit = (path: string): void => {
     changes.push({ path: `/w/${path}`, before: { kind: "text", text: "a\n" }, after: { kind: "text", text: "b\n" } });
   };
@@ -90,8 +88,10 @@ test("flush closes a capture whose end event never arrived", async () => {
 test("a capture that fails to start never blocks the command", async () => {
   const cards: EditCardData[] = [];
   const errors: unknown[] = [];
-  const tracker = new EditTracker({ start: async () => { throw new Error("boom"); } }, (card) => cards.push(card),
-    (error) => errors.push(error));
+  const tracker = new EditTracker((card) => cards.push(card), {
+    source: { start: async () => { throw new Error("boom"); } },
+    onError: (error) => errors.push(error),
+  });
   await tracker.shellStarting("1", "echo", "/w");
   await tracker.toolEnded("1", false);
   assert.equal(cards.length, 0);
