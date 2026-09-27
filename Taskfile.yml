@@ -61,3 +61,8 @@ tasks:
     desc: Score the parser against the private labeled sample, per model family and overall
     cmds:
       - pnpm eval
+
+  eval:share:
+    desc: Count how often each model edits through the shell instead of an edit tool, in local transcripts
+    cmds:
+      - pnpm share

@@ -21,15 +21,34 @@ interface Member {
 }
 
 interface Group {
+  /** The session's directory; card paths are shown relative to it. */
   cwd: string;
   capture: Promise<Capture | undefined>;
   members: Map<string, Member>;
-  /** Paths Pi's own edit/write tools touched while this group was open. */
+  /** Paths that tools with their own diff (edit, write, apply_patch) touched while this group was open. */
   shownElsewhere: Set<string>;
 }
 
-/** Built-in tools whose results already render a diff, keyed to their path argument. */
-const DIFFING_TOOLS = new Set(["edit", "write"]);
+/**
+ * Files a tool call edits when that tool already renders its own diff: Pi's
+ * `edit` and `write`, and `apply_patch` (OpenAI models, via Codex-compatible
+ * extensions), including `apply_patch` invoked through the shell.
+ */
+export function selfDiffingPaths(name: string, args: unknown): string[] {
+  const input = (args ?? {}) as { path?: unknown; file_path?: unknown; patch?: unknown; input?: unknown };
+  if (name === "edit" || name === "write") {
+    const path = input.path ?? input.file_path;
+    return typeof path === "string" ? [path] : [];
+  }
+  const patch = name === "apply_patch" ? input.patch ?? input.input ?? args : undefined;
+  return typeof patch === "string" ? patchPaths(patch) : [];
+}
+
+/** File paths named by a Codex-format patch (`*** Update File: path`, `*** Move to: path`, …). */
+export function patchPaths(patch: string): string[] {
+  if (!patch.includes("*** Begin Patch")) return [];
+  return [...patch.matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+?)\s*$/gm)].map((match) => match[1]!);
+}
 
 /**
  * Turns tool lifecycle events into edit cards.
@@ -41,7 +60,7 @@ const DIFFING_TOOLS = new Set(["edit", "write"]);
  */
 export class EditTracker {
   private group?: Group;
-  private readonly editsInFlight = new Map<string, string>();
+  private readonly editsInFlight = new Map<string, string[]>();
 
   private readonly source: CaptureSource;
   private readonly onError: (error: unknown) => void;
@@ -55,8 +74,10 @@ export class EditTracker {
   }
 
   /** Call before a shell command executes; resolves once its "before" state is recorded. */
-  async shellStarting(id: string, command: string, directory: string): Promise<void> {
+  async shellStarting(id: string, command: string, directory: string, sessionDirectory = directory): Promise<void> {
     const cwd = canonical(directory);
+    // `apply_patch <<'EOF'` through the shell is rendered as a patch by Codex-compatible extensions.
+    if (/^\s*(?:cd\s+\S+\s*&&\s*)?apply_patch\b/.test(command)) this.recordSelfDiffing(id, patchPaths(command), cwd);
     const open = this.group;
     if (open) {
       open.members.set(id, { command, done: false, failed: false });
@@ -68,9 +89,9 @@ export class EditTracker {
       return;
     }
     const group: Group = {
-      cwd,
+      cwd: canonical(sessionDirectory),
       members: new Map([[id, { command, done: false, failed: false }]]),
-      shownElsewhere: new Set(this.editsInFlight.values()),
+      shownElsewhere: new Set([...this.editsInFlight.values()].flat()),
       capture: this.source.start(command, cwd).catch((error) => {
         this.onError(error);
         return undefined;
@@ -82,13 +103,14 @@ export class EditTracker {
 
   /** Call when any tool starts executing. */
   toolStarted(id: string, name: string, args: unknown, cwd: string): void {
-    if (!DIFFING_TOOLS.has(name)) return;
-    const path = (args as { path?: unknown; file_path?: unknown } | undefined)?.path ??
-      (args as { file_path?: unknown } | undefined)?.file_path;
-    if (typeof path !== "string") return;
-    const absolute = resolve(canonical(cwd), path);
+    this.recordSelfDiffing(id, selfDiffingPaths(name, args), canonical(cwd));
+  }
+
+  private recordSelfDiffing(id: string, paths: string[], cwd: string): void {
+    if (!paths.length) return;
+    const absolute = paths.map((path) => resolve(cwd, path));
     this.editsInFlight.set(id, absolute);
-    this.group?.shownElsewhere.add(absolute);
+    for (const path of absolute) this.group?.shownElsewhere.add(path);
   }
 
   /** Call when any tool finishes; closes the capture after its last shell command. */

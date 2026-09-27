@@ -31,7 +31,8 @@
     "preview": "tsx scripts/preview.ts",
     "corpus": "tsx scripts/corpus.ts",
     "sample": "tsx scripts/sample.ts",
-    "eval": "tsx scripts/eval.ts"
+    "eval": "tsx scripts/eval.ts",
+    "share": "tsx scripts/share.ts"
   },
   "dependencies": {
     "@vscode/tree-sitter-wasm": "0.3.1",

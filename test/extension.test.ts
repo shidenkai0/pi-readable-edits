@@ -3,6 +3,7 @@ import { after, before, test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import readableEdits from "../src/index.js";
 import type { EditCardData } from "../src/render.js";
+import { join } from "node:path";
 import { cleanup, directory, piTheme, plain, repository, sh } from "./helpers.js";
 
 type Handler = (event: any, ctx: any) => unknown;
@@ -120,4 +121,45 @@ test("the command toggles observation", async () => {
   await bash(pi, ctx, "2", "echo c > a.txt");
   assert.equal(((await pi.emit("turn_end", { entries: [] }, ctx)) as { entries: unknown[] }).entries.length, 1);
   assert.deepEqual(notices, ["Readable edits off", "Readable edits on"]);
+});
+
+/** Runs a tool call the way Pi does, executing `run` in `cwd` between the start and end events. */
+async function tool(pi: ReturnType<typeof load>, ctx: object, id: string, toolName: string, input: object, run?: [string, string]) {
+  await pi.emit("tool_execution_start", { toolCallId: id, toolName, args: input }, ctx);
+  await pi.emit("tool_call", { toolCallId: id, toolName, input }, ctx);
+  if (run) sh(run[0], run[1]);
+  await pi.emit("tool_execution_end", { toolCallId: id, toolName, result: {}, isError: false }, ctx);
+}
+
+test("Codex command tools from OpenAI-compatibility extensions get cards, in their workdir", async () => {
+  const root = await repository({ "web/app.ts": "const a = 1;\n", "notes.md": "old\n" });
+  roots.push(root);
+  const pi = load();
+  const ctx = context(root);
+  await tool(pi, ctx, "e", "exec_command", { cmd: "sed -i.bak 's/1/2/' app.ts && rm app.ts.bak", workdir: "web" },
+    ["sed -i.bak 's/1/2/' app.ts && rm app.ts.bak", join(root, "web")]);
+  await tool(pi, ctx, "s", "shell_command", { command: "echo new > notes.md" }, ["echo new > notes.md", root]);
+  const result = await pi.emit("turn_end", { entries: [] }, ctx) as { entries: any[] };
+  assert.deepEqual(result.entries.map((entry) => (entry.data as EditCardData).files.map((file) => file.path)),
+    [["web/app.ts"], ["notes.md"]]);
+});
+
+test("files apply_patch edits are left to its own diff, even when a shell command touches them too", async () => {
+  const root = await repository({ "a.ts": "a\n", "b.ts": "b\n" });
+  roots.push(root);
+  const pi = load();
+  const ctx = context(root);
+  const patch = "*** Begin Patch\n*** Update File: a.ts\n@@\n-a\n+patched\n*** End Patch";
+  // The patch starts first and is still running when the shell command starts.
+  await pi.emit("tool_execution_start", { toolCallId: "p", toolName: "apply_patch", args: { patch } }, ctx);
+  await tool(pi, ctx, "x", "exec_command", { cmd: "echo x >> a.ts; echo y >> b.ts" }, ["echo x >> a.ts; echo y >> b.ts", root]);
+  await pi.emit("tool_execution_end", { toolCallId: "p", toolName: "apply_patch", result: {}, isError: false }, ctx);
+  // apply_patch invoked through the shell is rendered as a patch too, so it gets no card.
+  const shellPatch = "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: c.ts\n+c\n*** End Patch\nEOF";
+  await tool(pi, ctx, "y", "exec_command", { cmd: shellPatch }, ["printf 'c\\n' > c.ts", root]);
+  const result = await pi.emit("turn_end", { entries: [] }, ctx) as { entries: any[] };
+  assert.equal(result.entries.length, 1);
+  const card = result.entries[0].data as EditCardData;
+  assert.deepEqual(card.files.map((file) => file.path), ["b.ts"]);
+  assert.deepEqual(card.shownElsewhere, ["a.ts"]);
 });

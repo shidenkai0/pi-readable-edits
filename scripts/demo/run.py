@@ -110,6 +110,8 @@ def main():
     parser.add_argument("--resume", action="store_true", help="also reopen the saved session and screenshot it")
     parser.add_argument("--package", metavar="SOURCE",
                         help="pi install SOURCE into the isolated config instead of loading this checkout")
+    parser.add_argument("--with", dest="extra", action="append", default=[], metavar="PATH",
+                        help="also load this extension (repeatable), e.g. an OpenAI-compatibility extension")
     parser.add_argument("--crop", nargs=2, metavar=("FROM", "TO"),
                         help="keep screen rows from the first line containing FROM to the one before TO")
     args = parser.parse_args()
@@ -129,13 +131,15 @@ def main():
     script.write_text(json.dumps(scenario["steps"]))
 
     env = {**os.environ, "PI_CODING_AGENT_DIR": str(config), "PI_OFFLINE": "1", "TERM": "xterm-256color",
-           "COLORTERM": "truecolor", "READABLE_EDITS_SCRIPT": str(script)}
+           "COLORTERM": "truecolor", "READABLE_EDITS_SCRIPT": str(script),
+           "READABLE_EDITS_ACTIVATE": ",".join(scenario.get("activate", []))}
     sessions = work / "sessions"
     extension = [] if args.package else ["-e", str(REPO)]
     if args.package:
         subprocess.run(["pi", "install", args.package], cwd=project, env=env, check=True)
     argv = ["pi", "--session-dir", str(sessions), "--provider", "scripted", "--model", "demo",
-            *extension, "-e", str(REPO / "scripts/demo/scripted-model.ts")]
+            *extension, *[flag for path in args.extra for flag in ("-e", path)],
+            "-e", str(REPO / "scripts/demo/scripted-model.ts")]
     term = Terminal(argv, project, env, args.columns, args.rows)
     try:
         term.pump(4)

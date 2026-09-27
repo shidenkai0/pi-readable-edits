@@ -1,0 +1,18 @@
+{
+  "name": "shop-api",
+  "prompt": "Move the default port to 8080 and note it in the README",
+  "activate": ["exec_command", "write_stdin", "apply_patch"],
+  "files": {
+    "src/app.ts": "export const port = Number(process.env.PORT ?? 3000);\n",
+    "README.md": "# Shop API\n\nListens on port 3000 by default.\n",
+    "CHANGELOG.md": "# Changelog\n"
+  },
+  "steps": [
+    { "tools": [{ "name": "exec_command", "args": { "cmd": "sed -i '' 's/3000/8080/' app.ts", "workdir": "src" } }] },
+    { "tools": [
+      { "name": "apply_patch", "args": { "patch": "*** Begin Patch\n*** Update File: README.md\n@@\n-Listens on port 3000 by default.\n+Listens on port 8080 by default.\n*** End Patch" } },
+      { "name": "exec_command", "args": { "cmd": "printf -- '- Default port is now 8080.\\n' >> CHANGELOG.md" } }
+    ] },
+    { "text": "Done. The default port is 8080." }
+  ]
+}

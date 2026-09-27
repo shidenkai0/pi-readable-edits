@@ -1,9 +1,20 @@
+import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CARD_TYPE, type EditCardData, renderCard } from "./render.js";
 import { EditTracker } from "./tracker.js";
 
-/** Tools that run arbitrary shell commands, and so may edit files without showing a diff. */
-const SHELL_TOOLS = new Set(["bash", "powershell"]);
+/**
+ * Reads a tool call that runs a shell command: Pi's `bash`, or the Codex
+ * command tools (`exec_command`, `shell_command`) that OpenAI-compatibility
+ * extensions put in its place, which take a `workdir`.
+ */
+export function shellCall(toolName: string, input: unknown, cwd: string): { command: string; cwd: string } | undefined {
+  const args = (input ?? {}) as { command?: unknown; cmd?: unknown; workdir?: unknown };
+  const command = toolName === "bash" || toolName === "shell_command" ? args.command
+    : toolName === "exec_command" ? args.cmd : undefined;
+  if (typeof command !== "string") return undefined;
+  return { command, cwd: typeof args.workdir === "string" && args.workdir ? resolve(cwd, args.workdir) : cwd };
+}
 
 /**
  * Shows a diff card after shell commands that edit files.
@@ -33,11 +44,10 @@ export default function readableEdits(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!watching(ctx) || !SHELL_TOOLS.has(event.toolName)) return;
-    const command = (event.input as { command?: unknown }).command;
-    if (typeof command !== "string") return;
+    const shell = watching(ctx) ? shellCall(event.toolName, event.input, ctx.cwd) : undefined;
+    if (!shell) return;
     // A tool_call handler that throws would block the command, so never let one escape.
-    await tracker.shellStarting(event.toolCallId, command, ctx.cwd).catch(() => {});
+    await tracker.shellStarting(event.toolCallId, shell.command, shell.cwd, ctx.cwd).catch(() => {});
   });
 
   pi.on("tool_execution_end", async (event) => {
